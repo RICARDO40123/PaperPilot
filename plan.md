@@ -73,26 +73,38 @@
 - 更偏模型演示场景；
 - 复杂页面布局（多区块阅读器）可控性略弱于 Streamlit。
 
-结论：
-- 第一版建议用 `Streamlit`，在保证开发效率的同时，足以实现论文阅读辅助页面；
-- 后续若要做复杂交互，再考虑迁移到前后端分离架构（FastAPI + Vue/React）。
+结论（已定稿）：
+- **默认架构**：前后端分离、**全 Python**——**Streamlit** 负责页面与交互，**FastAPI** 负责解析 PDF/链接、调用大模型并返回 JSON；Streamlit 内用 **httpx/requests** 调用本地 API。
+- **回退策略**：若联调成本高或课设时间紧，可把 `services/` 直接从 Streamlit `app.py` 引用，暂时撤掉 HTTP 层，变为**一体化 Streamlit**，功能不变。
+- 若以后要「原生网页」重写前端，仍可保留 FastAPI，仅替换 Streamlit（例如 Vue/React/HTML），与当前后端契约兼容即可。
 
 ## 4.2 后端与服务
-- 应用框架：Streamlit（单体应用）；
-- 文本抽取：
-  - PDF：`pypdf` 或 `pdfplumber`；
-  - URL：`requests + BeautifulSoup4`（按网站规则抽取）；
-- AI 接口：通义千问 API（可通过官方 SDK 或 HTTP 调用）；
-- 配置管理：`.env` 存放 API Key；
-- 数据存储（MVP）：本地 JSON/Markdown 文件。
+
+**后端（FastAPI）**
+- 框架：`FastAPI`，本地用 `uvicorn` 启动（示例端口 `8000`）；
+- 跨域：对 Streamlit 来源配置 **CORS**（浏览器访问 `8501` 调 `8000` 属于跨端口）；
+- 文本抽取：PDF 用 `pypdf` 或 `pdfplumber`；URL 用 `requests + BeautifulSoup4`；
+- AI：通义千问 API（官方 SDK 或 HTTP）；
+- 配置：`.env` 存 API Key 等敏感项，`API_BASE_URL`/`BACKEND_URL` 供前端配置。
+
+**前端（Streamlit）**
+- 仅负责表单、上传、展示、导出按钮；业务通过 `POST /api/...` 把文件或正文片段交给后端；
+- `.env.example` 中注明 `BACKEND_URL=http://127.0.0.1:8000`（与部署一致时再改）。
+
+**数据（MVP）**
+- 可不落库；导出 Markdown 在用户浏览器侧由 Streamlit 生成即可。
 
 ## 4.3 模块划分
-- `ui/`：页面与交互逻辑；
-- `services/parser.py`：链接/PDF 文本解析；
-- `services/llm.py`：大模型调用封装；
-- `services/pipeline.py`：摘要、注释、翻译流程编排；
-- `models/schema.py`：结果数据结构定义；
-- `exports/`：结果导出（Markdown）。
+
+- **`api/main.py`**：FastAPI 应用入口、`CORS`、挂载路由；
+- **`api/routes/`**（或 `api/routers/`）：例如 `health.py`、`analyze.py`；
+- **`app.py`**（或 `frontend/app.py`）：Streamlit，薄层，只调后端 HTTP；
+- **`services/parser.py`**：链接/PDF 文本解析（供路由调用）；
+- **`services/llm.py`**：大模型调用封装；
+- **`services/pipeline.py`**：摘要、注释、翻译流程编排；
+- **`models/schema.py`**：请求/响应与领域模型；
+- **`exports/`**（可选）：Markdown 组装逻辑可被 Streamlit 或后端复用；
+- **`prompts/`**：提示词模板文件。
 
 ## 5. 关键流程设计
 
@@ -119,8 +131,9 @@
 ## 8. 开发计划（建议）
 
 ### 里程碑 1：MVP 基础（1-2 天）
-- 完成 Streamlit 页面骨架；
-- 支持 PDF 上传和 URL 输入；
+- 完成 FastAPI 启动脚本与健康检查路由；配置 CORS；
+- 完成 Streamlit 页面骨架，能通过 HTTP 调到后端；
+- 支持 PDF 上传和 URL 输入（解析在后端或通过接口传参）；
 - 完成文本抽取和基本展示。
 
 ### 里程碑 2：AI 能力接入（1-2 天）
