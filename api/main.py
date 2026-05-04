@@ -3,7 +3,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.routes import extract as extract_routes
+
 app = FastAPI(title="PaperPilot API", version="0.1.0")
+app.include_router(extract_routes.router)
 
 app.add_middleware(
     CORSMiddleware,
