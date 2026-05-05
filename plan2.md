@@ -21,6 +21,8 @@
 
 **与 PaperPilot 的关系**：PaperPilot 是你的 **Python 网页应用**（已定 **`Streamlit` + `FastAPI`** 分离，见 `final-plan.md` / `plan.md` 第 4 节；做不顺可回退单体 Streamlit）。`paper-analyst` 是 **提示词/流程/文档 + 小脚本** 的 bundle。二者可以并存：前端负责展示与导出，后端负责解析与 LLM，Skill 里的思想 **内化** 为 **系统提示词、JSON 响应契约、质检规则、可选预处理脚本**。
 
+**补充（已实现）**：PaperPilot 增加 **「自然语言 → 结构化阅读需求（`StructuredReadingIntent`）→ 仅基于该结构 + 论文摘录的精读建议」**，与 paper-analyst 强调的 **结构化输出、减少含糊输入带来的漂移** 一致；详见 `plan.md` 第 3.2.1 节与 `README.md` 功能表。
+
 ---
 
 ## 2. 借鉴是否可行？结论

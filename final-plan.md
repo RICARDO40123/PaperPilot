@@ -60,13 +60,14 @@ final/
   api/
     __init__.py
     main.py               # FastAPI 入口：CORS、挂载路由、uvicorn 指向它
-    routes/               # 可选：拆分 health、extract、analyze 等
+    routes/               # extract.py、reading.py 等
       __init__.py
   services/
     __init__.py
     parser.py             # PDF / URL 抽文本（由 FastAPI 路由调用）
-    llm.py                # 封装千问调用
-    pipeline.py           # 「解析 → 调模型 → 拼结果」（后写）
+    llm.py                # DashScope 千问 + JSON 解析
+    reading_pipeline.py   # 结构化需求 + 精读建议（两阶段 LLM）
+    pipeline.py           # 全文摘要 / 注释 / 翻译编排（后写）
   models/
     __init__.py
     schema.py             # Pydantic / dataclass：请求与响应、「分析结果」结构
@@ -112,18 +113,36 @@ pip install streamlit python-dotenv fastapi "uvicorn[standard]" httpx
 
 ---
 
+## 阶段 2.5（已实现）：结构化需求 + 精读建议
+
+在用户提示词较模糊时，先让模型把**自然语言阅读动机**整理成 **JSON 结构化需求**（`StructuredReadingIntent`），后续「是否精读」**只使用该 JSON + 论文摘录**，不再直接依赖用户原话。
+
+### 你要做的（对照仓库）
+
+1. `.env` 配置 **`DASHSCOPE_API_KEY`**（与可选 **`QWEN_MODEL`**）；`pip install dashscope`（见 `requirements.txt`）。  
+2. 后端路由：`api/routes/reading.py` — `POST /reading/structure-intent`、`POST /reading/recommend`、`POST /reading/advise`。  
+3. 编排与 Prompt：`services/reading_pipeline.py`；底层调用：`services/llm.py`。  
+4. 前端：`app.py` 中「精读建议」区块；抽取的 `paper_text` 写入 **Streamlit `session_state`** 供建议接口使用。
+
+### 完成标志
+
+- `/docs` 可调通 `structure-intent` 与 `recommend`；页面上能先看到结构化 JSON，再看到 Markdown 形式的精读结论。  
+- 未配置 Key 时接口返回 **503** 等明确错误，而非静默失败。
+
+---
+
 ## 阶段 3：接通大脑——千问 API 走通一条路（建议后端直连 Key）
 
 ### 你要做的
 
 1. 开通通义千问（DashScope 等），把 Key 放进 `.env`（**仅后端进程读取**，不要传到 Streamlit 浏览器）。  
-2. 在 `services/llm.py` 写调用函数；在 FastAPI 增加 `POST /llm/ping` 或临时路由，入参一段固定字符串，返回模型回复（先「一句话自我介绍」测试）。  
-3. 再用「下面是摘要，列 3 个中文要点」测通；确认**稳定返回**。  
-4. Streamlit 只调 `POST /llm/ping`（或后续正式 `POST /analyze`），**不**在浏览器里放 API Key。
+2. 在 `services/llm.py` 写调用函数；可用 **`POST /reading/structure-intent`** 或临时 `POST /llm/ping` 验证连通（若尚未写 ping，以 `reading` 路由为准）。  
+3. 再用论文摘录 + 结构化需求走 **`/reading/recommend`**，或单独写「摘要列要点」类接口；确认**稳定返回**。  
+4. Streamlit 经 `httpx` 调上述路由，**不**在浏览器里放 API Key。
 
 ### 完成标志
 
-- 仅启动后端即可用 `/docs` 试通千问（可选）；Streamlit 按钮能经 HTTP 看到返回。  
+- 启动后端后可用 `/docs` 试通千问相关接口；Streamlit 精读区块能经 HTTP 看到返回。  
 - Key 错误或欠费时，后端返回 4xx/5xx + `detail`，前端 `st.error` 显示人话。
 
 ---

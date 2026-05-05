@@ -33,6 +33,15 @@
   - 适用场景和局限；
   - “是否值得精读”建议（含理由）。
 
+### 3.2.1 结构化阅读需求与精读建议（已实现）
+
+针对用户提示词**模糊**的问题，采用**两阶段、意图与原文解耦**的设计：
+
+1. **自然语言 → 结构化需求**：用户说明「为何读此文、想得到什么启发」等；模型输出固定 schema 的 JSON（如动机、期望产出、信息缺口、约束、开放问题、对含糊点的说明），对应领域模型 **`StructuredReadingIntent`**（见 `models/intent.py`）。
+2. **精读建议仅依赖结构化结果**：第二步请求**只传**`structured_intent` + 论文文本摘录，**不传用户原始自然语言**；模型结合摘录给出是否精读、正反理由与下一步，对应 **`ReadingRecommendation`**（见 `models/recommendation.py`）。
+
+对外 API（FastAPI）：`POST /reading/structure-intent`、`POST /reading/recommend`、`POST /reading/advise`（一键）。实现见 `services/reading_pipeline.py`、`services/llm.py`、`api/routes/reading.py`。与「全文摘要 / 关键句 / 翻译」等能力可并行演进，不互相替代。
+
 ### 3.3 关键句注释
 - 自动抽取若干关键句（例如 5-10 句）；
 - 对每句生成简短注释，解释其意义（方法创新点、实验结论、限制条件等）；
@@ -97,24 +106,26 @@
 ## 4.3 模块划分
 
 - **`api/main.py`**：FastAPI 应用入口、`CORS`、挂载路由；
-- **`api/routes/`**（或 `api/routers/`）：例如 `health.py`、`analyze.py`；
-- **`app.py`**（或 `frontend/app.py`）：Streamlit，薄层，只调后端 HTTP；
+- **`api/routes/`**：例如 `extract.py`（PDF 抽取）、`reading.py`（结构化需求 + 精读建议）；
+- **`app.py`**：Streamlit，薄层，只调后端 HTTP；
 - **`services/parser.py`**：链接/PDF 文本解析（供路由调用）；
-- **`services/llm.py`**：大模型调用封装；
-- **`services/pipeline.py`**：摘要、注释、翻译流程编排；
-- **`models/schema.py`**：请求/响应与领域模型；
-- **`exports/`**（可选）：Markdown 组装逻辑可被 Streamlit 或后端复用；
-- **`prompts/`**：提示词模板文件。
+- **`services/llm.py`**：DashScope（千问）调用与 JSON 解析；
+- **`services/reading_pipeline.py`**：结构化意图 + 精读建议两段 Prompt 与编排；
+- **`services/pipeline.py`**（规划）：全文摘要、注释、翻译等编排；
+- **`models/`**：`extract.py`、`intent.py`、`recommendation.py`、`reading_api.py` 等请求/响应与领域模型；
+- **`exports/`**（可选）：Markdown 组装逻辑；
+- **`prompts/`**（可选）：提示词文件；当前部分 Prompt 内嵌于 `reading_pipeline.py`。
 
 ## 5. 关键流程设计
 
 1. 用户上传 PDF 或输入链接。  
 2. 系统解析并提取正文（必要时分段/分块）。  
-3. 调用 LLM 生成概括信息与“是否值得读”建议。  
-4. 抽取关键句并生成注释。  
-5. 执行翻译，按段落形成中英对照。  
-6. 页面展示：摘要卡片 + 关键句注释 + 左右对照阅读区。  
-7. 用户复制或导出结果到本地，后续手动整理进 Zotero。
+3. **（已实现分支）**用户可输入阅读动机等自然语言 → LLM 产出 **结构化需求** → 再仅基于该结构与论文摘录调用 LLM 产出 **精读建议**（是否精读、理由）。  
+4. 调用 LLM 生成概括信息与（若未走 3 的独立链路）其它“是否值得读”辅助信息。  
+5. 抽取关键句并生成注释。  
+6. 执行翻译，按段落形成中英对照。  
+7. 页面展示：摘要卡片 + 精读建议 + 关键句注释 + 左右对照阅读区。  
+8. 用户复制或导出结果到本地，后续手动整理进 Zotero。
 
 ## 6. 非功能需求
 - 响应速度：单篇论文初次处理控制在可接受范围（例如 10-60 秒，取决于长度与 API 延迟）；
