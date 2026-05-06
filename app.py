@@ -1,6 +1,7 @@
 """PaperPilot Streamlit UI — thin client calling FastAPI."""
 
 import os
+import time
 from html import escape
 
 import httpx
@@ -16,6 +17,12 @@ TIMEOUT_HEALTH = 10.0
 TIMEOUT_EXTRACT = 120.0
 TIMEOUT_READING = 180.0
 TIMEOUT_ANALYZE = 240.0
+TIMEOUT_ANALYZE_JOB = 15.0
+TIMEOUT_READING_JOB = 15.0
+ANALYZE_POLL_INTERVAL = 1.0
+MAX_ANALYZE_JOB_WAIT_SEC = 600.0
+MAX_TRANSLATE_JOB_WAIT_SEC = 600.0
+MAX_READING_JOB_WAIT_SEC = 600.0
 PREVIEW_CHARS = 8000
 
 st.set_page_config(page_title="PaperPilot", layout="wide")
@@ -41,10 +48,63 @@ if "reader_page_count" not in st.session_state:
     st.session_state.reader_page_count = 0
 if "reader_current_page" not in st.session_state:
     st.session_state.reader_current_page = 1
+if "reader_page_input" not in st.session_state:
+    st.session_state.reader_page_input = 1
+if "reader_nav_to_page" not in st.session_state:
+    st.session_state.reader_nav_to_page = None
 if "page_text_cache" not in st.session_state:
     st.session_state.page_text_cache = {}
 if "translation_cache" not in st.session_state:
     st.session_state.translation_cache = {}
+if "analyze_job_id" not in st.session_state:
+    st.session_state.analyze_job_id = None
+if "analyze_job_started_at" not in st.session_state:
+    st.session_state.analyze_job_started_at = 0.0
+if "translate_job_id" not in st.session_state:
+    st.session_state.translate_job_id = None
+if "translate_job_started_at" not in st.session_state:
+    st.session_state.translate_job_started_at = 0.0
+if "translate_job_cache_key" not in st.session_state:
+    st.session_state.translate_job_cache_key = ""
+if "reading_job_id" not in st.session_state:
+    st.session_state.reading_job_id = None
+if "reading_job_started_at" not in st.session_state:
+    st.session_state.reading_job_started_at = 0.0
+if "reading_job_kind" not in st.session_state:
+    st.session_state.reading_job_kind = ""
+
+def _render_analysis_result(data: dict) -> None:
+    if data.get("truncation_note"):
+        st.info(data["truncation_note"])
+    st.markdown(f"### 一句话\n{data.get('one_liner_zh', '')}")
+    st.markdown(
+        f"**类型**：{data.get('paper_type_guess', '')}  "
+        f"**元信息**：{data.get('metadata_summary', '')}"
+    )
+    st.markdown("### 方法要点")
+    st.markdown(data.get("method_summary") or "—")
+    st.markdown("### 局限")
+    st.markdown(data.get("limitations") or "—")
+    st.markdown("### 关键句")
+    for i, row in enumerate(data.get("key_sentences") or [], start=1):
+        if not isinstance(row, dict):
+            continue
+        with st.expander(f"关键句 {i}"):
+            st.markdown(f"> {row.get('en', '')}")
+            st.markdown(f"**注释**：{row.get('zh_note', '')}")
+            st.markdown(f"**重要性**：{row.get('why_important', '')}")
+    st.caption(f"已生成段落对照：**{len(data.get('paragraph_pairs') or [])}** 对。")
+    md_bytes = analysis_to_markdown(data).encode("utf-8")
+    st.download_button(
+        label="下载 Markdown",
+        data=md_bytes,
+        file_name="paperpilot_analysis.md",
+        mime="text/markdown",
+        key="download_analysis_md",
+    )
+    with st.expander("原始 JSON（分析结果）"):
+        st.json(data)
+
 
 def _fmt_recommendation(data: dict) -> str:
     rec = data.get("recommendation", data)
@@ -107,24 +167,6 @@ def _fetch_page_image(page: int, dpi: int) -> bytes:
             detail = r.text
         raise RuntimeError(f"渲染第 {page} 页图片失败（HTTP {r.status_code}）：{detail}")
     return r.content
-
-
-def _translate_text(text: str, mode: str) -> str:
-    key = f"{mode}::{text.strip()}"
-    cached = st.session_state.translation_cache.get(key)
-    if cached:
-        return cached
-    with httpx.Client(timeout=TIMEOUT_ANALYZE, trust_env=False) as client:
-        r = client.post(f"{backend_url}/translate", json={"text": text, "mode": mode})
-    if r.status_code != 200:
-        try:
-            detail = r.json().get("detail", r.text)
-        except Exception:  # noqa: BLE001
-            detail = r.text
-        raise RuntimeError(f"翻译失败（HTTP {r.status_code}）：{detail}")
-    zh = str(r.json().get("zh", "")).strip()
-    st.session_state.translation_cache[key] = zh
-    return zh
 
 
 def _render_page_like(text: str, height: int = 780) -> None:
@@ -217,6 +259,8 @@ if st.button("抽取正文", key="btn_extract"):
                 st.session_state.pdf_bytes = file_bytes
                 st.session_state.pdf_name = uploaded.name
                 st.session_state.reader_current_page = 1
+                st.session_state.reader_page_input = 1
+                st.session_state.reader_nav_to_page = None
                 st.session_state.reader_page_count = 0
                 st.session_state.page_text_cache = {}
                 st.session_state.translation_cache = {}
@@ -244,20 +288,28 @@ st.divider()
 st.subheader("双栏阅读器（纯 Python：左图右译）")
 st.caption(
     "左侧按页渲染 PDF 图片，右侧显示整页中文翻译（页面阅读样式）。"
+    " 「翻译本页」为后台任务 + 轮询，避免长时间卡住界面。"
     " 若为扫描版 PDF，整页文本抽取可能较弱。"
 )
 
 if not st.session_state.pdf_bytes:
     st.info("请先在上方上传并抽取 PDF，之后可在此进行按页阅读与翻译。")
 else:
+    # Apply deferred navigation target before instantiating widgets.
+    nav_target = st.session_state.get("reader_nav_to_page")
+    if isinstance(nav_target, int) and nav_target >= 1:
+        st.session_state.reader_current_page = nav_target
+        st.session_state.reader_page_input = nav_target
+        st.session_state.reader_nav_to_page = None
+
     c_page, c_dpi, c_cache = st.columns([1, 1, 1])
     with c_page:
         st.number_input(
             "当前页码",
             min_value=1,
-            value=max(1, int(st.session_state.reader_current_page)),
+            value=max(1, int(st.session_state.reader_page_input)),
             step=1,
-            key="reader_current_page",
+            key="reader_page_input",
         )
     with c_dpi:
         page_dpi = st.slider("页面清晰度(DPI)", min_value=96, max_value=260, value=160, step=8)
@@ -270,15 +322,18 @@ else:
     nav_l, nav_m, nav_r = st.columns([1, 1, 2])
     with nav_l:
         if st.button("上一页", key="btn_prev_page"):
-            st.session_state.reader_current_page = max(
-                1, int(st.session_state.reader_current_page) - 1
+            st.session_state.reader_nav_to_page = max(
+                1, int(st.session_state.reader_page_input) - 1
             )
+            st.rerun()
     with nav_m:
         if st.button("下一页", key="btn_next_page"):
-            next_page = int(st.session_state.reader_current_page) + 1
+            next_page = int(st.session_state.reader_page_input) + 1
             max_page = st.session_state.reader_page_count or next_page
-            st.session_state.reader_current_page = min(next_page, max_page)
+            st.session_state.reader_nav_to_page = min(next_page, max_page)
+            st.rerun()
     with nav_r:
+        st.session_state.reader_current_page = int(st.session_state.reader_page_input)
         if st.session_state.reader_page_count:
             st.caption(f"已知总页数：**{st.session_state.reader_page_count}**")
         else:
@@ -313,10 +368,23 @@ else:
             page_cache_key = f"page::{st.session_state.reader_current_page}"
             if st.button("翻译本页", key="btn_translate_page"):
                 try:
-                    zh_page = _translate_text(page_text, mode="page")
-                    st.session_state.translation_cache[page_cache_key] = zh_page
-                except RuntimeError as e:
-                    st.error(str(e))
+                    with httpx.Client(timeout=30.0, trust_env=False) as client:
+                        r = client.post(
+                            f"{backend_url}/translate/submit",
+                            json={"text": page_text, "mode": "page"},
+                        )
+                    if r.status_code == 200:
+                        st.session_state.translate_job_id = r.json().get("job_id")
+                        st.session_state.translate_job_started_at = time.time()
+                        st.session_state.translate_job_cache_key = page_cache_key
+                        st.success("已提交翻译任务…")
+                        st.rerun()
+                    else:
+                        try:
+                            detail = r.json().get("detail", r.text)
+                        except Exception:  # noqa: BLE001
+                            detail = r.text
+                        st.error(f"提交翻译失败（HTTP {r.status_code}）：{detail}")
                 except httpx.RequestError as e:
                     st.error(f"请求失败：{e}")
 
@@ -325,11 +393,70 @@ else:
             else:
                 st.info("点击“翻译本页”后，这里会显示与左侧对应的整页中文内容。")
 
+tid = st.session_state.translate_job_id
+if tid:
+    elapsed_t = time.time() - float(st.session_state.translate_job_started_at or 0)
+    if elapsed_t > MAX_TRANSLATE_JOB_WAIT_SEC:
+        st.error("翻译等待超时，请重试。")
+        st.session_state.translate_job_id = None
+    else:
+        try:
+            with httpx.Client(timeout=TIMEOUT_ANALYZE_JOB, trust_env=False) as client:
+                r = client.get(f"{backend_url}/translate/job/{tid}")
+            if r.status_code == 404:
+                st.warning("翻译任务已过期或不存在。")
+                st.session_state.translate_job_id = None
+            elif r.status_code != 200:
+                try:
+                    detail = r.json().get("detail", r.text)
+                except Exception:  # noqa: BLE001
+                    detail = r.text
+                st.error(f"查询翻译任务失败（HTTP {r.status_code}）：{detail}")
+            else:
+                job = r.json()
+                status = job.get("status", "")
+                prog = int(job.get("progress") or 0)
+                st.progress(min(max(prog, 0), 100) / 100.0)
+                if status == "queued":
+                    st.info("翻译：**排队中**…")
+                elif status == "running":
+                    st.info("翻译：**进行中**…")
+                elif status == "failed":
+                    st.error(job.get("error") or "翻译失败")
+                    st.session_state.translate_job_id = None
+                elif status == "done":
+                    ckey = st.session_state.translate_job_cache_key or ""
+                    with httpx.Client(timeout=TIMEOUT_ANALYZE, trust_env=False) as client:
+                        rr = client.get(f"{backend_url}/translate/result/{tid}")
+                    if rr.status_code == 200:
+                        zh = str(rr.json().get("zh", "")).strip()
+                        if ckey:
+                            st.session_state.translation_cache[ckey] = zh
+                        st.session_state.translate_job_id = None
+                        st.success("翻译完成")
+                        st.rerun()
+                    else:
+                        try:
+                            detail = rr.json().get("detail", rr.text)
+                        except Exception:  # noqa: BLE001
+                            detail = rr.text
+                        st.error(f"获取翻译结果失败（HTTP {rr.status_code}）：{detail}")
+                        st.session_state.translate_job_id = None
+                else:
+                    st.warning(f"未知翻译任务状态：{status}")
+
+                if st.session_state.translate_job_id and status in ("queued", "running"):
+                    if not st.session_state.analyze_job_id and not st.session_state.reading_job_id:
+                        time.sleep(ANALYZE_POLL_INTERVAL)
+                        st.rerun()
+        except httpx.RequestError as e:
+            st.error(f"翻译轮询失败：{e}")
+
 st.divider()
-st.subheader("全文分析（千问 · POST /analyze）")
+st.subheader("全文分析（千问 · 异步任务）")
 st.caption(
-    "基于会话中的 **论文正文** 调用千问，一次性生成概括、关键句点评与中英段落对照。"
-    " 需 **OPENAI_API_KEY**（OpenAI 兼容接口）。超长正文仅截取前 N 字（见下方）。"
+    "基于会话中的 **论文正文** 调用千问，生成概括、关键句点评与段落对照。"
+    " 提交后后台执行，页面会轮询状态；需 **OPENAI_API_KEY**。超长正文仅截取前 N 字（见下方）。"
 )
 
 analyze_mode = st.radio(
@@ -358,81 +485,90 @@ if st.button("生成全文分析", key="btn_analyze"):
                 "mode": analyze_mode,
                 "max_input_chars": int(analyze_cap),
             }
-            with httpx.Client(timeout=TIMEOUT_ANALYZE, trust_env=False) as client:
-                r = client.post(f"{backend_url}/analyze", json=payload)
+            with httpx.Client(timeout=30.0, trust_env=False) as client:
+                r = client.post(f"{backend_url}/analyze/submit", json=payload)
             if r.status_code == 200:
-                data = r.json()
-                st.session_state.analysis_result = data
-                if data.get("truncation_note"):
-                    st.info(data["truncation_note"])
-                st.markdown(f"### 一句话\n{data.get('one_liner_zh', '')}")
-                st.markdown(f"**类型**：{data.get('paper_type_guess', '')}  \n**元信息**：{data.get('metadata_summary', '')}")
-                st.markdown("### 方法要点")
-                st.markdown(data.get("method_summary") or "—")
-                st.markdown("### 局限")
-                st.markdown(data.get("limitations") or "—")
-                st.markdown("### 关键句")
-                for i, row in enumerate(data.get("key_sentences") or [], start=1):
-                    if not isinstance(row, dict):
-                        continue
-                    with st.expander(f"关键句 {i}"):
-                        st.markdown(f"> {row.get('en', '')}")
-                        st.markdown(f"**注释**：{row.get('zh_note', '')}")
-                        st.markdown(f"**重要性**：{row.get('why_important', '')}")
-                st.caption(
-                    f"已生成中英段落对照：**{len(data.get('paragraph_pairs') or [])}** 对。"
-                )
-                md_bytes = analysis_to_markdown(data).encode("utf-8")
-                st.download_button(
-                    label="下载 Markdown",
-                    data=md_bytes,
-                    file_name="paperpilot_analysis.md",
-                    mime="text/markdown",
-                    key="download_analysis_md",
-                )
-                with st.expander("原始 JSON（/analyze）"):
-                    st.json(data)
+                body = r.json()
+                st.session_state.analyze_job_id = body.get("job_id")
+                st.session_state.analyze_job_started_at = time.time()
+                st.success("已提交分析任务，正在排队/执行…")
+                st.rerun()
             else:
                 try:
                     detail = r.json().get("detail", r.text)
                 except Exception:  # noqa: BLE001
                     detail = r.text
-                st.error(f"分析失败（HTTP {r.status_code}）：{detail}")
+                st.error(f"提交失败（HTTP {r.status_code}）：{detail}")
         except httpx.RequestError as e:
             st.error(f"请求失败：{e}")
 
+jid = st.session_state.analyze_job_id
+if jid:
+    elapsed = time.time() - float(st.session_state.analyze_job_started_at or 0)
+    if elapsed > MAX_ANALYZE_JOB_WAIT_SEC:
+        st.error("分析等待超时，请重试或检查后端与模型服务。")
+        st.session_state.analyze_job_id = None
+    else:
+        try:
+            with httpx.Client(timeout=TIMEOUT_ANALYZE_JOB, trust_env=False) as client:
+                r = client.get(f"{backend_url}/analyze/job/{jid}")
+            if r.status_code == 404:
+                st.warning("任务已过期或不存在，请重新提交。")
+                st.session_state.analyze_job_id = None
+            elif r.status_code != 200:
+                try:
+                    detail = r.json().get("detail", r.text)
+                except Exception:  # noqa: BLE001
+                    detail = r.text
+                st.error(f"查询任务失败（HTTP {r.status_code}）：{detail}")
+            else:
+                job = r.json()
+                status = job.get("status", "")
+                prog = int(job.get("progress") or 0)
+                st.progress(min(max(prog, 0), 100) / 100.0)
+                if status == "queued":
+                    st.info("任务状态：**排队中**（等待并发槽位）…")
+                elif status == "running":
+                    st.info("任务状态：**分析中**（模型生成中）…")
+                elif status == "failed":
+                    st.error(job.get("error") or "分析失败")
+                    st.session_state.analyze_job_id = None
+                elif status == "done":
+                    with httpx.Client(timeout=TIMEOUT_ANALYZE, trust_env=False) as client:
+                        rr = client.get(f"{backend_url}/analyze/result/{jid}")
+                    if rr.status_code == 200:
+                        st.session_state.analysis_result = rr.json()
+                        st.session_state.analyze_job_id = None
+                        st.success("分析完成")
+                        st.rerun()
+                    else:
+                        try:
+                            detail = rr.json().get("detail", rr.text)
+                        except Exception:  # noqa: BLE001
+                            detail = rr.text
+                        st.error(f"获取结果失败（HTTP {rr.status_code}）：{detail}")
+                        st.session_state.analyze_job_id = None
+                else:
+                    st.warning(f"未知任务状态：{status}")
+
+                if st.session_state.analyze_job_id and status in ("queued", "running"):
+                    if not st.session_state.reading_job_id:
+                        time.sleep(ANALYZE_POLL_INTERVAL)
+                        st.rerun()
+        except httpx.RequestError as e:
+            st.error(f"轮询失败：{e}")
+
 analysis_data = st.session_state.analysis_result
 if analysis_data:
-    st.markdown("### 中英翻译对照阅读")
-    c_open, c_close = st.columns(2)
-    with c_open:
-        if st.button("打开中英对照", key="btn_open_bilingual"):
-            st.session_state.show_bilingual_panel = True
-    with c_close:
-        if st.button("收起中英对照", key="btn_close_bilingual"):
-            st.session_state.show_bilingual_panel = False
-
-    if st.session_state.show_bilingual_panel:
-        pairs = analysis_data.get("paragraph_pairs") or []
-        if not pairs:
-            st.info("当前分析结果里没有段落对照，请先点击“生成全文分析”。")
-        else:
-            st.caption("左侧英文原文，右侧中文翻译。")
-            for i, row in enumerate(pairs, start=1):
-                if not isinstance(row, dict):
-                    continue
-                st.markdown(f"**段落 {i}**")
-                c_en, c_zh = st.columns(2)
-                with c_en:
-                    st.markdown(row.get("en", "") or "—")
-                with c_zh:
-                    st.markdown(row.get("zh", "") or "—")
+    st.markdown("### 分析结果")
+    _render_analysis_result(analysis_data)
 
 st.divider()
 st.subheader("精读建议（千问 · 结构化需求）")
 st.caption(
     "流程：**自然语言 → 结构化 JSON（唯一意图依据）→ 结合论文摘录给出是否精读**。"
     " 后续推理**不直接使用**你的原始句子，只使用结构化结果。"
+    " 以下为后台任务 + 轮询，避免长时间卡住界面。"
     " 需在 `.env` 配置 **OPENAI_API_KEY**（可配合 DashScope 兼容模式），并 `pip install openai`。"
 )
 
@@ -463,22 +599,23 @@ if do_structure:
         st.warning("请先填写上面的阅读动机/需求。")
     else:
         try:
-            with httpx.Client(timeout=TIMEOUT_READING, trust_env=False) as client:
+            with httpx.Client(timeout=30.0, trust_env=False) as client:
                 r = client.post(
-                    f"{backend_url}/reading/structure-intent",
+                    f"{backend_url}/reading/structure-intent/submit",
                     json={"user_prompt": user_prompt.strip()},
                 )
             if r.status_code == 200:
-                st.session_state.structured_intent = r.json()
-                st.session_state.last_recommendation = None
-                st.success("已生成结构化需求（已写入会话）")
-                st.json(st.session_state.structured_intent)
+                st.session_state.reading_job_id = r.json().get("job_id")
+                st.session_state.reading_job_kind = "structure"
+                st.session_state.reading_job_started_at = time.time()
+                st.success("已提交结构化任务…")
+                st.rerun()
             else:
                 try:
                     detail = r.json().get("detail", r.text)
                 except Exception:  # noqa: BLE001
                     detail = r.text
-                st.error(f"失败（HTTP {r.status_code}）：{detail}")
+                st.error(f"提交失败（HTTP {r.status_code}）：{detail}")
         except httpx.RequestError as e:
             st.error(f"请求失败：{e}")
 
@@ -492,25 +629,23 @@ if do_recommend:
                 "paper_text": st.session_state.paper_text,
                 "max_paper_chars": int(max_chars),
             }
-            with httpx.Client(timeout=TIMEOUT_READING, trust_env=False) as client:
+            with httpx.Client(timeout=30.0, trust_env=False) as client:
                 r = client.post(
-                    f"{backend_url}/reading/recommend",
+                    f"{backend_url}/reading/recommend/submit",
                     json=payload,
                 )
             if r.status_code == 200:
-                body = r.json()
-                st.session_state.last_recommendation = body
-                used = body.get("paper_chars_used", 0)
-                st.caption(f"本次用于建议的论文摘录长度：**{used}** 字符。")
-                st.markdown(_fmt_recommendation(body))
-                with st.expander("原始 JSON（recommendation）"):
-                    st.json(body.get("recommendation", body))
+                st.session_state.reading_job_id = r.json().get("job_id")
+                st.session_state.reading_job_kind = "recommend"
+                st.session_state.reading_job_started_at = time.time()
+                st.success("已提交精读建议任务…")
+                st.rerun()
             else:
                 try:
                     detail = r.json().get("detail", r.text)
                 except Exception:  # noqa: BLE001
                     detail = r.text
-                st.error(f"失败（HTTP {r.status_code}）：{detail}")
+                st.error(f"提交失败（HTTP {r.status_code}）：{detail}")
         except httpx.RequestError as e:
             st.error(f"请求失败：{e}")
 
@@ -519,9 +654,9 @@ if do_pipeline:
         st.warning("请先填写阅读动机/需求。")
     else:
         try:
-            with httpx.Client(timeout=TIMEOUT_READING, trust_env=False) as client:
+            with httpx.Client(timeout=30.0, trust_env=False) as client:
                 r = client.post(
-                    f"{backend_url}/reading/advise",
+                    f"{backend_url}/reading/advise/submit",
                     json={
                         "user_prompt": user_prompt.strip(),
                         "paper_text": st.session_state.paper_text,
@@ -529,27 +664,98 @@ if do_pipeline:
                     },
                 )
             if r.status_code == 200:
-                body = r.json()
-                st.session_state.structured_intent = body.get("structured_intent")
-                st.session_state.last_recommendation = {
-                    "recommendation": body.get("recommendation"),
-                    "paper_chars_used": body.get("paper_chars_used", 0),
-                }
-                st.success("已完成结构化 + 精读建议")
-                with st.expander("结构化需求（后续步骤仅依赖此对象）"):
-                    st.json(body.get("structured_intent"))
-                st.caption(
-                    f"论文摘录使用：**{body.get('paper_chars_used', 0)}** 字符。"
-                )
-                st.markdown(_fmt_recommendation(body))
+                st.session_state.reading_job_id = r.json().get("job_id")
+                st.session_state.reading_job_kind = "advise"
+                st.session_state.reading_job_started_at = time.time()
+                st.success("已提交一键任务…")
+                st.rerun()
             else:
                 try:
                     detail = r.json().get("detail", r.text)
                 except Exception:  # noqa: BLE001
                     detail = r.text
-                st.error(f"失败（HTTP {r.status_code}）：{detail}")
+                st.error(f"提交失败（HTTP {r.status_code}）：{detail}")
         except httpx.RequestError as e:
             st.error(f"请求失败：{e}")
+
+rid = st.session_state.reading_job_id
+if rid:
+    elapsed_r = time.time() - float(st.session_state.reading_job_started_at or 0)
+    if elapsed_r > MAX_READING_JOB_WAIT_SEC:
+        st.error("精读任务等待超时，请重试。")
+        st.session_state.reading_job_id = None
+    else:
+        try:
+            with httpx.Client(timeout=TIMEOUT_READING_JOB, trust_env=False) as client:
+                r = client.get(f"{backend_url}/reading/job/{rid}")
+            if r.status_code == 404:
+                st.warning("任务已过期或不存在。")
+                st.session_state.reading_job_id = None
+            elif r.status_code != 200:
+                try:
+                    detail = r.json().get("detail", r.text)
+                except Exception:  # noqa: BLE001
+                    detail = r.text
+                st.error(f"查询任务失败（HTTP {r.status_code}）：{detail}")
+            else:
+                job = r.json()
+                status = job.get("status", "")
+                kind = job.get("kind", st.session_state.reading_job_kind)
+                prog = int(job.get("progress") or 0)
+                st.progress(min(max(prog, 0), 100) / 100.0)
+                if status == "queued":
+                    st.info(f"精读任务（{kind}）：**排队中**…")
+                elif status == "running":
+                    st.info(f"精读任务（{kind}）：**进行中**…")
+                elif status == "failed":
+                    st.error(job.get("error") or "任务失败")
+                    st.session_state.reading_job_id = None
+                elif status == "done":
+                    with httpx.Client(timeout=TIMEOUT_READING, trust_env=False) as client:
+                        rr = client.get(f"{backend_url}/reading/result/{rid}")
+                    if rr.status_code == 200:
+                        body = rr.json()
+                        st.session_state.reading_job_id = None
+                        if kind == "structure":
+                            st.session_state.structured_intent = body
+                            st.session_state.last_recommendation = None
+                            st.success("已生成结构化需求（已写入会话）")
+                            st.json(st.session_state.structured_intent)
+                        elif kind == "recommend":
+                            st.session_state.last_recommendation = body
+                            st.success("精读建议已生成")
+                        elif kind == "advise":
+                            st.session_state.structured_intent = body.get(
+                                "structured_intent"
+                            )
+                            st.session_state.last_recommendation = {
+                                "recommendation": body.get("recommendation"),
+                                "paper_chars_used": body.get("paper_chars_used", 0),
+                            }
+                            st.success("已完成结构化 + 精读建议")
+                    else:
+                        try:
+                            detail = rr.json().get("detail", rr.text)
+                        except Exception:  # noqa: BLE001
+                            detail = rr.text
+                        st.error(f"获取结果失败（HTTP {rr.status_code}）：{detail}")
+                        st.session_state.reading_job_id = None
+                else:
+                    st.warning(f"未知任务状态：{status}")
+
+                if st.session_state.reading_job_id and status in ("queued", "running"):
+                    time.sleep(ANALYZE_POLL_INTERVAL)
+                    st.rerun()
+        except httpx.RequestError as e:
+            st.error(f"轮询失败：{e}")
+
+if st.session_state.last_recommendation:
+    body = st.session_state.last_recommendation
+    used = body.get("paper_chars_used", 0)
+    st.caption(f"论文摘录使用：**{used}** 字符。")
+    st.markdown(_fmt_recommendation(body))
+    with st.expander("原始 JSON（recommendation）"):
+        st.json(body.get("recommendation", body))
 
 if st.session_state.structured_intent and not (do_structure or do_pipeline):
     with st.expander("当前会话中的结构化需求"):
