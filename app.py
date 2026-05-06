@@ -1,7 +1,7 @@
 """PaperPilot Streamlit UI — thin client calling FastAPI."""
 
 import os
-import re
+from html import escape
 
 import httpx
 import streamlit as st
@@ -127,33 +127,31 @@ def _translate_text(text: str, mode: str) -> str:
     return zh
 
 
-def _split_paragraphs(text: str) -> list[str]:
-    blocks = [b.strip() for b in re.split(r"\n\s*\n+", text or "") if b.strip()]
-    out: list[str] = []
-    for block in blocks:
-        if len(block) <= 600:
-            out.append(block)
-            continue
-        segs = [
-            s.strip()
-            for s in re.split(r"(?<=[\.\!\?;:])\s+(?=[A-Z0-9])", block)
-            if s.strip()
-        ]
-        if not segs:
-            out.append(block)
-            continue
-        buf = ""
-        for seg in segs:
-            candidate = f"{buf} {seg}".strip()
-            if len(candidate) <= 600:
-                buf = candidate
-            else:
-                if buf:
-                    out.append(buf)
-                buf = seg
-        if buf:
-            out.append(buf)
-    return out[:80]
+def _render_page_like(text: str, height: int = 780) -> None:
+    safe = escape(text or "—")
+    st.markdown(
+        f"""
+<div style="
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 22px 26px;
+    min-height: {height}px;
+    max-height: {height}px;
+    overflow: auto;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+">
+  <div style="
+      white-space: pre-wrap;
+      line-height: 1.8;
+      font-size: 16px;
+      color: #222;
+      font-family: 'Times New Roman', 'Noto Serif SC', serif;
+  ">{safe}</div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # --- 健康检查 ---
@@ -245,8 +243,8 @@ if st.session_state.paper_text:
 st.divider()
 st.subheader("双栏阅读器（纯 Python：左图右译）")
 st.caption(
-    "左侧按页渲染 PDF 图片，右侧支持按页翻译与按段落翻译。"
-    " 若为扫描版 PDF，段落抽取可能较弱。"
+    "左侧按页渲染 PDF 图片，右侧显示整页中文翻译（页面阅读样式）。"
+    " 若为扫描版 PDF，整页文本抽取可能较弱。"
 )
 
 if not st.session_state.pdf_bytes:
@@ -298,7 +296,7 @@ else:
             st.error(f"请求失败：{e}")
 
     with right:
-        st.markdown("#### 翻译面板")
+        st.markdown("#### 中文页（整页翻译）")
         page_text = ""
         try:
             page_text, total = _fetch_page_text(st.session_state.reader_current_page)
@@ -323,41 +321,9 @@ else:
                     st.error(f"请求失败：{e}")
 
             if st.session_state.translation_cache.get(page_cache_key):
-                st.markdown("**本页中文**")
-                st.text_area(
-                    "page_zh_view",
-                    value=st.session_state.translation_cache.get(page_cache_key, ""),
-                    height=220,
-                    label_visibility="collapsed",
-                )
-
-            paragraphs = _split_paragraphs(page_text)
-            st.markdown(f"**段落翻译（当前页共 {len(paragraphs)} 段）**")
-            if not paragraphs:
-                st.info("当前页无法切分段落。")
+                _render_page_like(st.session_state.translation_cache.get(page_cache_key, ""))
             else:
-                idx = st.selectbox(
-                    "选择段落",
-                    options=list(range(len(paragraphs))),
-                    format_func=lambda i: f"段落 {i + 1}: {(paragraphs[i][:72] + '...') if len(paragraphs[i]) > 72 else paragraphs[i]}",
-                    key="reader_para_idx",
-                )
-                st.text_area("段落原文", value=paragraphs[idx], height=120)
-                para_cache_key = f"para::{st.session_state.reader_current_page}::{idx}"
-                if st.button("翻译选中段落", key="btn_translate_para"):
-                    try:
-                        zh_para = _translate_text(paragraphs[idx], mode="paragraph")
-                        st.session_state.translation_cache[para_cache_key] = zh_para
-                    except RuntimeError as e:
-                        st.error(str(e))
-                    except httpx.RequestError as e:
-                        st.error(f"请求失败：{e}")
-                if st.session_state.translation_cache.get(para_cache_key):
-                    st.text_area(
-                        "段落中文",
-                        value=st.session_state.translation_cache.get(para_cache_key, ""),
-                        height=140,
-                    )
+                st.info("点击“翻译本页”后，这里会显示与左侧对应的整页中文内容。")
 
 st.divider()
 st.subheader("全文分析（千问 · POST /analyze）")
