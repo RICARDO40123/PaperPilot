@@ -2,7 +2,7 @@
 
 > **项目名**：PaperPilot  
 > **做什么**：一个用 Python 写的本地网页，帮你读论文——摘要、关键句注释、中英对照、是否值得放进 Zotero——省掉反复复制粘贴。  
-> **技术路线**：**Streamlit（前端） + FastAPI（后端）**，全 Python 前后端分离；通义千问 API + PDF/链接解析在后端完成（详见 `plan.md` 第 4 节）。  
+> **技术路线**：**Streamlit（前端） + FastAPI（后端）**，全 Python 前后端分离；通义千问（OpenAI 兼容协议）+ PDF/链接解析在后端完成（详见 `plan.md` 第 4 节）。  
 > **回退方案**：分离做不顺时，可把 `services/` 直接在 Streamlit 里 `import`，两个终端变一个，`streamlit run` 即可（功能对齐，报告里写明「单体回退版」即可）。  
 > **好思路从哪来**：参考 `paper-analyst` 的「结构化输出 + 反幻觉标注 + PDF 质量分层」，写进我们自己的 Prompt 和页面，**不依赖** Claude Skill 运行时（详见 `plan2.md`）。
 
@@ -54,7 +54,7 @@
 final/
   app.py                  # Streamlit：只做 UI + 用 httpx 调后端（薄）
   requirements.txt        # 依赖列表
-  .env                    # DASHSCOPE_API_KEY、BACKEND_URL（不要提交）
+  .env                    # OPENAI_API_KEY、BACKEND_URL（不要提交）
   .env.example            # 只写变量名与示例 URL，供提交用
   .gitignore              # 忽略 .env、__pycache__、.venv 等
   api/
@@ -65,7 +65,7 @@ final/
   services/
     __init__.py
     parser.py             # PDF / URL 抽文本（由 FastAPI 路由调用）
-    llm.py                # DashScope 千问 + JSON 解析
+    llm.py                # OpenAI 兼容接口（用于千问）+ JSON 解析
     reading_pipeline.py   # 结构化需求 + 精读建议（两阶段 LLM）
     pipeline.py           # 全文摘要 / 注释 / 翻译编排（后写）
   models/
@@ -83,7 +83,7 @@ python -m venv .venv
 pip install streamlit python-dotenv fastapi "uvicorn[standard]" httpx
 ```
 
-后续再按需加：`pypdf` 或 `pymupdf`、`requests`、`beautifulsoup4`、阿里云 dashscope SDK 等。
+后续再按需加：`pypdf` 或 `pymupdf`、`requests`、`beautifulsoup4`、`openai` SDK 等。
 
 3. **`api/main.py` 首期目标**：挂载 `GET /health`（返回 `{"ok": true}`），并配置 **CORS** 允许 `http://localhost:8501` 与 `http://127.0.0.1:8501`（开发期可先宽松，交作业前再收紧）。
 
@@ -119,7 +119,7 @@ pip install streamlit python-dotenv fastapi "uvicorn[standard]" httpx
 
 ### 你要做的（对照仓库）
 
-1. `.env` 配置 **`DASHSCOPE_API_KEY`**（与可选 **`QWEN_MODEL`**）；`pip install dashscope`（见 `requirements.txt`）。  
+1. `.env` 配置 **`OPENAI_API_KEY`**（可选 **`OPENAI_BASE_URL`**、**`OPENAI_MODEL`**）；`pip install openai`（见 `requirements.txt`）。  
 2. 后端路由：`api/routes/reading.py` — `POST /reading/structure-intent`、`POST /reading/recommend`、`POST /reading/advise`。  
 3. 编排与 Prompt：`services/reading_pipeline.py`；底层调用：`services/llm.py`。  
 4. 前端：`app.py` 中「精读建议」区块；抽取的 `paper_text` 写入 **Streamlit `session_state`** 供建议接口使用。

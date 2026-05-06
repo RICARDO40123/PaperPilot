@@ -1,4 +1,4 @@
-"""DashScope (Qwen) helpers — JSON-oriented chat."""
+"""OpenAI-compatible helpers for Qwen JSON-oriented chat."""
 
 from __future__ import annotations
 
@@ -8,66 +8,58 @@ import re
 from typing import Any
 
 try:
-    from http import HTTPStatus
-
-    import dashscope
-    from dashscope import Generation
+    from openai import OpenAI
 except ImportError:
-    dashscope = None
-    Generation = None
-    HTTPStatus = None
+    OpenAI = None
 
 
 class LLMConfigError(RuntimeError):
     """Missing key or SDK."""
 
 
-def _require_client() -> None:
-    if Generation is None or dashscope is None:
-        raise LLMConfigError("未安装 dashscope，请执行：pip install dashscope")
-    key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+def _require_client() -> OpenAI:
+    if OpenAI is None:
+        raise LLMConfigError("未安装 openai，请执行：pip install openai")
+    key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
-        raise LLMConfigError("未配置环境变量 DASHSCOPE_API_KEY")
-    dashscope.api_key = key
+        raise LLMConfigError("未配置环境变量 OPENAI_API_KEY")
+    base_url = (
+        os.getenv(
+            "OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        ).strip()
+        or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+    return OpenAI(api_key=key, base_url=base_url)
 
 
 def _default_model() -> str:
-    return os.getenv("QWEN_MODEL", "qwen-turbo").strip() or "qwen-turbo"
+    return os.getenv("OPENAI_MODEL", "qwen-turbo").strip() or "qwen-turbo"
 
 
 def _message_content(resp: Any) -> str:
-    out = resp.output
-    if isinstance(out, dict):
-        choices = out.get("choices") or []
-        if not choices:
-            raise RuntimeError("模型返回无 choices")
-        msg = choices[0].get("message") or {}
-        return (msg.get("content") or "").strip()
-    choices = getattr(out, "choices", None)
+    choices = getattr(resp, "choices", None)
     if not choices:
         raise RuntimeError("模型返回无 choices")
-    msg = getattr(choices[0], "message", None)
+    msg = choices[0].message
     if msg is None:
         raise RuntimeError("模型返回无 message")
-    return (getattr(msg, "content", None) or "").strip()
+    return (msg.content or "").strip()
 
 
 def chat_text(system: str, user: str) -> str:
     """单次对话，返回助手文本。"""
-    _require_client()
+    client = _require_client()
     model = _default_model()
-    resp = Generation.call(
+    try:
+        resp = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        result_format="message",
-    )
-    code = getattr(resp, "status_code", None)
-    if code is not None and HTTPStatus is not None and code != HTTPStatus.OK:
-        msg = getattr(resp, "message", None) or str(resp)
-        raise RuntimeError(f"DashScope 错误 ({code}): {msg}")
+        )
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"OpenAI 兼容接口调用失败：{e}") from e
     return _message_content(resp)
 
 

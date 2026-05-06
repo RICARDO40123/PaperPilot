@@ -1,6 +1,7 @@
 """PaperPilot Streamlit UI — thin client calling FastAPI."""
 
 import os
+import re
 
 import httpx
 import streamlit as st
@@ -28,6 +29,22 @@ if "structured_intent" not in st.session_state:
     st.session_state.structured_intent = None
 if "last_recommendation" not in st.session_state:
     st.session_state.last_recommendation = None
+if "analysis_result" not in st.session_state:
+    st.session_state.analysis_result = None
+if "show_bilingual_panel" not in st.session_state:
+    st.session_state.show_bilingual_panel = False
+if "pdf_bytes" not in st.session_state:
+    st.session_state.pdf_bytes = b""
+if "pdf_name" not in st.session_state:
+    st.session_state.pdf_name = ""
+if "reader_page_count" not in st.session_state:
+    st.session_state.reader_page_count = 0
+if "reader_current_page" not in st.session_state:
+    st.session_state.reader_current_page = 1
+if "page_text_cache" not in st.session_state:
+    st.session_state.page_text_cache = {}
+if "translation_cache" not in st.session_state:
+    st.session_state.translation_cache = {}
 
 def _fmt_recommendation(data: dict) -> str:
     rec = data.get("recommendation", data)
@@ -46,6 +63,97 @@ def _fmt_recommendation(data: dict) -> str:
     for x in rec.get("next_steps") or []:
         lines.append(f"- {x}")
     return "\n".join(lines)
+
+
+def _pdf_file_tuple() -> tuple[str, bytes, str]:
+    return (
+        st.session_state.pdf_name or "uploaded.pdf",
+        st.session_state.pdf_bytes,
+        "application/pdf",
+    )
+
+
+def _fetch_page_text(page: int) -> tuple[str, int]:
+    key = f"page_text::{page}"
+    cached = st.session_state.page_text_cache.get(key)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        return cached
+    files = {"file": _pdf_file_tuple()}
+    data = {"page": str(page)}
+    with httpx.Client(timeout=TIMEOUT_EXTRACT, trust_env=False) as client:
+        r = client.post(f"{backend_url}/extract/page-text", files=files, data=data)
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("detail", r.text)
+        except Exception:  # noqa: BLE001
+            detail = r.text
+        raise RuntimeError(f"获取第 {page} 页文本失败（HTTP {r.status_code}）：{detail}")
+    body = r.json()
+    text = str(body.get("text", ""))
+    page_count = int(body.get("page_count", 0))
+    st.session_state.page_text_cache[key] = (text, page_count)
+    return text, page_count
+
+
+def _fetch_page_image(page: int, dpi: int) -> bytes:
+    files = {"file": _pdf_file_tuple()}
+    data = {"page": str(page), "dpi": str(dpi)}
+    with httpx.Client(timeout=TIMEOUT_EXTRACT, trust_env=False) as client:
+        r = client.post(f"{backend_url}/extract/page-image", files=files, data=data)
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("detail", r.text)
+        except Exception:  # noqa: BLE001
+            detail = r.text
+        raise RuntimeError(f"渲染第 {page} 页图片失败（HTTP {r.status_code}）：{detail}")
+    return r.content
+
+
+def _translate_text(text: str, mode: str) -> str:
+    key = f"{mode}::{text.strip()}"
+    cached = st.session_state.translation_cache.get(key)
+    if cached:
+        return cached
+    with httpx.Client(timeout=TIMEOUT_ANALYZE, trust_env=False) as client:
+        r = client.post(f"{backend_url}/translate", json={"text": text, "mode": mode})
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("detail", r.text)
+        except Exception:  # noqa: BLE001
+            detail = r.text
+        raise RuntimeError(f"翻译失败（HTTP {r.status_code}）：{detail}")
+    zh = str(r.json().get("zh", "")).strip()
+    st.session_state.translation_cache[key] = zh
+    return zh
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    blocks = [b.strip() for b in re.split(r"\n\s*\n+", text or "") if b.strip()]
+    out: list[str] = []
+    for block in blocks:
+        if len(block) <= 600:
+            out.append(block)
+            continue
+        segs = [
+            s.strip()
+            for s in re.split(r"(?<=[\.\!\?;:])\s+(?=[A-Z0-9])", block)
+            if s.strip()
+        ]
+        if not segs:
+            out.append(block)
+            continue
+        buf = ""
+        for seg in segs:
+            candidate = f"{buf} {seg}".strip()
+            if len(candidate) <= 600:
+                buf = candidate
+            else:
+                if buf:
+                    out.append(buf)
+                buf = seg
+        if buf:
+            out.append(buf)
+    return out[:80]
 
 
 # --- 健康检查 ---
@@ -90,10 +198,11 @@ if st.button("抽取正文", key="btn_extract"):
     if not uploaded:
         st.warning("请先选择 PDF 文件。")
     else:
+        file_bytes = uploaded.getvalue()
         files = {
             "file": (
                 uploaded.name,
-                uploaded.getvalue(),
+                file_bytes,
                 "application/pdf",
             )
         }
@@ -107,6 +216,12 @@ if st.button("抽取正文", key="btn_extract"):
                 if data.get("warning"):
                     st.warning(data["warning"])
                 text = data.get("text", "")
+                st.session_state.pdf_bytes = file_bytes
+                st.session_state.pdf_name = uploaded.name
+                st.session_state.reader_current_page = 1
+                st.session_state.reader_page_count = 0
+                st.session_state.page_text_cache = {}
+                st.session_state.translation_cache = {}
                 st.session_state.paper_text = text
                 st.caption(
                     f"共 **{len(text)}** 个字符（已保存到会话）；下方预览前 **{PREVIEW_CHARS}** 字。"
@@ -128,10 +243,127 @@ if st.session_state.paper_text:
     st.caption(f"当前会话已缓存论文文本：**{len(st.session_state.paper_text)}** 字符。")
 
 st.divider()
+st.subheader("双栏阅读器（纯 Python：左图右译）")
+st.caption(
+    "左侧按页渲染 PDF 图片，右侧支持按页翻译与按段落翻译。"
+    " 若为扫描版 PDF，段落抽取可能较弱。"
+)
+
+if not st.session_state.pdf_bytes:
+    st.info("请先在上方上传并抽取 PDF，之后可在此进行按页阅读与翻译。")
+else:
+    c_page, c_dpi, c_cache = st.columns([1, 1, 1])
+    with c_page:
+        st.number_input(
+            "当前页码",
+            min_value=1,
+            value=max(1, int(st.session_state.reader_current_page)),
+            step=1,
+            key="reader_current_page",
+        )
+    with c_dpi:
+        page_dpi = st.slider("页面清晰度(DPI)", min_value=96, max_value=260, value=160, step=8)
+    with c_cache:
+        if st.button("清空阅读器缓存", key="btn_clear_reader_cache"):
+            st.session_state.page_text_cache = {}
+            st.session_state.translation_cache = {}
+            st.success("已清空页文本与翻译缓存。")
+
+    nav_l, nav_m, nav_r = st.columns([1, 1, 2])
+    with nav_l:
+        if st.button("上一页", key="btn_prev_page"):
+            st.session_state.reader_current_page = max(
+                1, int(st.session_state.reader_current_page) - 1
+            )
+    with nav_m:
+        if st.button("下一页", key="btn_next_page"):
+            next_page = int(st.session_state.reader_current_page) + 1
+            max_page = st.session_state.reader_page_count or next_page
+            st.session_state.reader_current_page = min(next_page, max_page)
+    with nav_r:
+        if st.session_state.reader_page_count:
+            st.caption(f"已知总页数：**{st.session_state.reader_page_count}**")
+        else:
+            st.caption("总页数将在首次拉取页文本或渲染后更新。")
+
+    left, right = st.columns([1, 1])
+    with left:
+        st.markdown("#### 原文页图")
+        try:
+            image = _fetch_page_image(st.session_state.reader_current_page, page_dpi)
+            st.image(image, use_container_width=True)
+        except RuntimeError as e:
+            st.error(str(e))
+        except httpx.RequestError as e:
+            st.error(f"请求失败：{e}")
+
+    with right:
+        st.markdown("#### 翻译面板")
+        page_text = ""
+        try:
+            page_text, total = _fetch_page_text(st.session_state.reader_current_page)
+            if total:
+                st.session_state.reader_page_count = total
+        except RuntimeError as e:
+            st.error(str(e))
+        except httpx.RequestError as e:
+            st.error(f"请求失败：{e}")
+
+        if not page_text.strip():
+            st.warning("当前页未抽取到可用文本（可能是扫描页或图片页）。")
+        else:
+            page_cache_key = f"page::{st.session_state.reader_current_page}"
+            if st.button("翻译本页", key="btn_translate_page"):
+                try:
+                    zh_page = _translate_text(page_text, mode="page")
+                    st.session_state.translation_cache[page_cache_key] = zh_page
+                except RuntimeError as e:
+                    st.error(str(e))
+                except httpx.RequestError as e:
+                    st.error(f"请求失败：{e}")
+
+            if st.session_state.translation_cache.get(page_cache_key):
+                st.markdown("**本页中文**")
+                st.text_area(
+                    "page_zh_view",
+                    value=st.session_state.translation_cache.get(page_cache_key, ""),
+                    height=220,
+                    label_visibility="collapsed",
+                )
+
+            paragraphs = _split_paragraphs(page_text)
+            st.markdown(f"**段落翻译（当前页共 {len(paragraphs)} 段）**")
+            if not paragraphs:
+                st.info("当前页无法切分段落。")
+            else:
+                idx = st.selectbox(
+                    "选择段落",
+                    options=list(range(len(paragraphs))),
+                    format_func=lambda i: f"段落 {i + 1}: {(paragraphs[i][:72] + '...') if len(paragraphs[i]) > 72 else paragraphs[i]}",
+                    key="reader_para_idx",
+                )
+                st.text_area("段落原文", value=paragraphs[idx], height=120)
+                para_cache_key = f"para::{st.session_state.reader_current_page}::{idx}"
+                if st.button("翻译选中段落", key="btn_translate_para"):
+                    try:
+                        zh_para = _translate_text(paragraphs[idx], mode="paragraph")
+                        st.session_state.translation_cache[para_cache_key] = zh_para
+                    except RuntimeError as e:
+                        st.error(str(e))
+                    except httpx.RequestError as e:
+                        st.error(f"请求失败：{e}")
+                if st.session_state.translation_cache.get(para_cache_key):
+                    st.text_area(
+                        "段落中文",
+                        value=st.session_state.translation_cache.get(para_cache_key, ""),
+                        height=140,
+                    )
+
+st.divider()
 st.subheader("全文分析（千问 · POST /analyze）")
 st.caption(
     "基于会话中的 **论文正文** 调用千问，一次性生成概括、关键句点评与中英段落对照。"
-    " 需 **DASHSCOPE_API_KEY**。超长正文仅截取前 N 字（见下方）。"
+    " 需 **OPENAI_API_KEY**（OpenAI 兼容接口）。超长正文仅截取前 N 字（见下方）。"
 )
 
 analyze_mode = st.radio(
@@ -164,6 +396,7 @@ if st.button("生成全文分析", key="btn_analyze"):
                 r = client.post(f"{backend_url}/analyze", json=payload)
             if r.status_code == 200:
                 data = r.json()
+                st.session_state.analysis_result = data
                 if data.get("truncation_note"):
                     st.info(data["truncation_note"])
                 st.markdown(f"### 一句话\n{data.get('one_liner_zh', '')}")
@@ -180,16 +413,9 @@ if st.button("生成全文分析", key="btn_analyze"):
                         st.markdown(f"> {row.get('en', '')}")
                         st.markdown(f"**注释**：{row.get('zh_note', '')}")
                         st.markdown(f"**重要性**：{row.get('why_important', '')}")
-                st.markdown("### 中英对照（按段）")
-                for i, row in enumerate(data.get("paragraph_pairs") or [], start=1):
-                    if not isinstance(row, dict):
-                        continue
-                    st.markdown(f"**段落 {i}**")
-                    c_en, c_zh = st.columns(2)
-                    with c_en:
-                        st.markdown(row.get("en", "") or "—")
-                    with c_zh:
-                        st.markdown(row.get("zh", "") or "—")
+                st.caption(
+                    f"已生成中英段落对照：**{len(data.get('paragraph_pairs') or [])}** 对。"
+                )
                 md_bytes = analysis_to_markdown(data).encode("utf-8")
                 st.download_button(
                     label="下载 Markdown",
@@ -209,12 +435,39 @@ if st.button("生成全文分析", key="btn_analyze"):
         except httpx.RequestError as e:
             st.error(f"请求失败：{e}")
 
+analysis_data = st.session_state.analysis_result
+if analysis_data:
+    st.markdown("### 中英翻译对照阅读")
+    c_open, c_close = st.columns(2)
+    with c_open:
+        if st.button("打开中英对照", key="btn_open_bilingual"):
+            st.session_state.show_bilingual_panel = True
+    with c_close:
+        if st.button("收起中英对照", key="btn_close_bilingual"):
+            st.session_state.show_bilingual_panel = False
+
+    if st.session_state.show_bilingual_panel:
+        pairs = analysis_data.get("paragraph_pairs") or []
+        if not pairs:
+            st.info("当前分析结果里没有段落对照，请先点击“生成全文分析”。")
+        else:
+            st.caption("左侧英文原文，右侧中文翻译。")
+            for i, row in enumerate(pairs, start=1):
+                if not isinstance(row, dict):
+                    continue
+                st.markdown(f"**段落 {i}**")
+                c_en, c_zh = st.columns(2)
+                with c_en:
+                    st.markdown(row.get("en", "") or "—")
+                with c_zh:
+                    st.markdown(row.get("zh", "") or "—")
+
 st.divider()
 st.subheader("精读建议（千问 · 结构化需求）")
 st.caption(
     "流程：**自然语言 → 结构化 JSON（唯一意图依据）→ 结合论文摘录给出是否精读**。"
     " 后续推理**不直接使用**你的原始句子，只使用结构化结果。"
-    " 需在 `.env` 配置 **DASHSCOPE_API_KEY**，并 `pip install dashscope`。"
+    " 需在 `.env` 配置 **OPENAI_API_KEY**（可配合 DashScope 兼容模式），并 `pip install openai`。"
 )
 
 user_prompt = st.text_area(

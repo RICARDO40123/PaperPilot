@@ -10,3 +10,11 @@ class ExtractResponse(BaseModel):
     pdf_quality: str = Field(..., description="良好 / 降级 / 严重降级 及简短原因")
     source: str = Field(default="upload", description="upload | url")
     warning: str | None = Field(default=None, description="可选提示")
+
+
+class PageTextResponse(BaseModel):
+    """POST /extract/page-text 返回：单页正文。"""
+
+    page: int = Field(..., description="1-based 页码")
+    page_count: int = Field(..., description="总页数")
+    text: str = Field(default="", description="该页抽取文本")
