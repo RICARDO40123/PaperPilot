@@ -121,6 +121,111 @@ def parse_analyze_raw(raw_text: str, req: AnalyzeRequest, excerpt_len: int, trun
     return resp
 
 
+TABLE_TEMPLATE = """| 维度 | 内容 |
+|------|------|
+| 论文标题 | |
+| 作者 | |
+| 发表年份 | |
+| 研究问题 | |
+| 研究方法 | |
+| 主要发现 | |
+| 创新点 | |
+| 局限性 | |
+| 与本研究的关联 | |"""
+
+TABLE_SYSTEM = """你是科研论文阅读助手。你的任务是：从输入的论文内容摘录中，抽取信息并填写指定维度的 Markdown 表格。
+
+硬性输出规则：
+1. 只输出 Markdown 表格，不要输出任何解释、标题、编号或额外文本。
+2. 表格必须严格符合给定模板的 Markdown 表格语法与行数；每个维度都必须有且仅一行对应内容。
+3. 若摘录中没有该维度的相关信息，填写“未提及”。
+4. 每个维度内容需信息充分、具体、可验证，尽量包含关键细节（如任务设定、方法机制、实验现象、指标趋势、数据规模或约束条件），避免泛泛而谈。
+5. 不限制句数，但需控制长度：单个维度建议不超过约 300 字；只有在信息确实必要时可略超。
+6. 内容使用中文。
+"""
+
+
+def build_table_user_message(req: AnalyzeRequest) -> tuple[str, str]:
+    raw = req.paper_text or ""
+    if len(raw.strip()) < 20:
+        raise ValueError("论文文本过短，请先抽取正文。")
+    cap = max(2000, min(req.max_input_chars, len(raw)))
+    excerpt = raw[:cap].strip()
+    truncated = len(raw) > len(excerpt)
+
+    user_msg = (
+        "请仔细阅读以下学术论文的内容，并按照给定的表格模板填写每个维度的信息。\n\n"
+        "要求：\n"
+        "1. 严格按照表格模板的格式输出，保持 Markdown 表格语法\n"
+        "2. 每个维度都需要填写，如果论文中没有相关信息，填写\"未提及\"\n"
+        "3. 内容应信息充分、具体、可验证，尽量给出关键细节，避免泛泛而谈\n"
+        "4. 使用中文填写\n"
+        "5. 不限制句数，但单个维度建议不超过约 140 字；只有在必要时可略超\n"
+        "6. 只输出填好的表格，不要添加额外说明\n\n"
+        "表格模板：\n"
+        f"{TABLE_TEMPLATE}\n\n"
+        "以下为论文内容摘录：\n"
+        f"{excerpt}\n"
+    )
+    if truncated:
+        user_msg += "\n（注：以上为前置摘录，可能存在信息不完整；请遵循“未提及”的规则。）\n"
+    return user_msg, excerpt
+
+
+def extract_markdown_table(text: str) -> str:
+    """从模型输出中尽量提取第一段 Markdown 表格。若失败则返回原文裁剪。"""
+    if not text:
+        return ""
+    target = "| 维度 | 内容 |"
+    lines = text.splitlines()
+    start_idx = None
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith(target):
+            start_idx = i
+            break
+    if start_idx is None:
+        return text.strip()
+    out: list[str] = []
+    for ln in lines[start_idx:]:
+        if ln.strip().startswith("|"):
+            out.append(ln.rstrip())
+        else:
+            # 表格中可能出现空行；空行也允许中断
+            if out:
+                break
+    md = "\n".join(out).strip()
+    return md or text.strip()
+
+
+REVIEW_SYSTEM = """你是学术综述助手。你只需要输出“综合文献综述”的正文内容，不要输出任何额外说明、标题前的数字列表说明、或参考文献列表。
+要求：
+1. 使用中文学术表达。
+2. 当你引用某篇论文的信息时，必须使用 [num] 格式标注（num 从 1 开始，对应输入表格的顺序）。
+3. 不要输出 Markdown 表格。
+4. 不要输出与综述无关的内容。"""
+
+
+def build_review_user_message(tables: list[str]) -> str:
+    indexed = []
+    for i, t in enumerate(tables, start=1):
+        indexed.append(f"[{i}]\n{t}")
+    tables_block = "\n\n".join(indexed)
+
+    user_msg = (
+        "请阅读以下多篇学术论文（每篇以填写好的 9 维度表格形式给出），生成一份综合性文献综述报告，包括：\n\n"
+        "1. **研究主题概述**: 简述这些论文共同关注的研究领域和核心问题\n"
+        "2. **各论文主要贡献**: 逐一总结每篇论文的核心观点、方法和发现\n"
+        "3. **研究方法对比**: 分析各论文采用的研究方法的异同\n"
+        "4. **主要发现汇总**: 综合各论文的主要结论和发现\n"
+        "5. **研究趋势与展望**: 基于这些论文，分析该领域的发展趋势和未来研究方向\n\n"
+        "对于所有引用的内容或结论，使用[num]格式标注（如[1]、[2]），其中num对应各文献的编号。有多个引用来源时使用[1][2][3]格式。"
+        "无需在最后给出完整参考文献列表。请使用清晰的结构和学术性语言。确保综述内容准确、逻辑连贯。\n\n"
+        "输入表格如下：\n"
+        f"{tables_block}\n"
+    )
+    return user_msg
+
+
 def coerce_relaxed_dict(data: dict) -> dict:
     """补齐缺失键，便于降级校验。"""
     defaults = {

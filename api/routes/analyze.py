@@ -13,9 +13,15 @@ from services.analyze_pipeline import (
     build_analyze_user_message,
     parse_analyze_raw,
     run_analyze,
+    TABLE_SYSTEM,
+    build_table_user_message,
+    extract_markdown_table,
+    REVIEW_SYSTEM,
+    build_review_user_message,
 )
 from services.llm import LLMConfigError
 from services.task_store import analyze_job_store, start_analyze_job
+from models.review_api import ReviewRequest
 
 router = APIRouter(tags=["analyze"])
 
@@ -49,6 +55,44 @@ def post_analyze_stream(body: AnalyzeRequest) -> StreamingResponse:
                 yield _stream_event({"type": "delta", "text": chunk})
             parsed = parse_analyze_raw("".join(pieces), body, excerpt_len, truncated)
             yield _stream_event({"type": "final", "data": parsed.model_dump()})
+        except Exception as e:  # noqa: BLE001
+            yield _stream_event({"type": "error", "detail": str(e)})
+
+    return StreamingResponse(_gen(), media_type="application/x-ndjson; charset=utf-8")
+
+
+@router.post("/analyze/table/stream")
+def post_analyze_table_stream(body: AnalyzeRequest) -> StreamingResponse:
+    def _gen() -> Iterator[bytes]:
+        try:
+            user_msg, _excerpt = build_table_user_message(body)
+            pieces: list[str] = []
+            for chunk in llm.chat_text_stream(TABLE_SYSTEM, user_msg):
+                if not chunk:
+                    continue
+                pieces.append(chunk)
+                yield _stream_event({"type": "delta", "text": chunk})
+            table_md = extract_markdown_table("".join(pieces))
+            yield _stream_event({"type": "final", "data": {"table_markdown": table_md}})
+        except Exception as e:  # noqa: BLE001
+            yield _stream_event({"type": "error", "detail": str(e)})
+
+    return StreamingResponse(_gen(), media_type="application/x-ndjson; charset=utf-8")
+
+
+@router.post("/review/stream")
+def post_review_stream(body: ReviewRequest) -> StreamingResponse:
+    def _gen() -> Iterator[bytes]:
+        try:
+            user_msg = build_review_user_message(body.tables)
+            pieces: list[str] = []
+            for chunk in llm.chat_text_stream(REVIEW_SYSTEM, user_msg):
+                if not chunk:
+                    continue
+                pieces.append(chunk)
+                yield _stream_event({"type": "delta", "text": chunk})
+            review_md = "".join(pieces).strip()
+            yield _stream_event({"type": "final", "data": {"review_markdown": review_md}})
         except Exception as e:  # noqa: BLE001
             yield _stream_event({"type": "error", "detail": str(e)})
 

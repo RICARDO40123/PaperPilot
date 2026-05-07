@@ -3,6 +3,7 @@
 import os
 import time
 import json
+import uuid
 from html import escape
 
 import httpx
@@ -71,6 +72,8 @@ if "reading_job_id" not in st.session_state:
     st.session_state.reading_job_id = None
 if "reading_job_started_at" not in st.session_state:
     st.session_state.reading_job_started_at = 0.0
+if "reading_job_paper_id" not in st.session_state:
+    st.session_state.reading_job_paper_id = None
 if "reading_job_kind" not in st.session_state:
     st.session_state.reading_job_kind = ""
 if "reader_poll_translate_ui" not in st.session_state:
@@ -79,6 +82,133 @@ if "analyze_poll_ui" not in st.session_state:
     st.session_state.analyze_poll_ui = {}
 if "reading_poll_ui" not in st.session_state:
     st.session_state.reading_poll_ui = {}
+
+if "papers" not in st.session_state:
+    # paper_id -> per-paper isolated state
+    st.session_state.papers = {}
+if "current_paper_id" not in st.session_state:
+    st.session_state.current_paper_id = None
+if "analyze_table_markdown" not in st.session_state:
+    st.session_state.analyze_table_markdown = ""
+if "review_markdown" not in st.session_state:
+    st.session_state.review_markdown = ""
+
+
+def _new_paper_entry(
+    paper_id: str,
+    pdf_name: str,
+    pdf_bytes: bytes,
+    paper_text: str = "",
+) -> dict:
+    inferred_len = len((paper_text or "").strip())
+    analyze_default = min(100000, max(2000, inferred_len if inferred_len else 14000))
+    reading_default = min(100000, max(2000, inferred_len if inferred_len else 12000))
+    return {
+        "paper_id": paper_id,
+        "pdf_name": pdf_name,
+        "pdf_bytes": pdf_bytes,
+        "paper_text": paper_text,
+        # reader view state
+        "reader_page_count": 0,
+        "reader_current_page": 1,
+        "reader_page_input": 1,
+        "reader_nav_to_page": None,
+        # reader caches
+        "reader_page_text_cache": {},
+        "reader_translation_cache": {},
+        "reader_page_image_cache": {},
+        # analyze/recommend results
+        "analyze_table_markdown": "",
+        "reading_structured_intent": None,
+        "reading_last_recommendation": None,
+        "analyze_max_chars": analyze_default,
+        "reading_max_paper_chars": reading_default,
+    }
+
+
+def _ensure_current_paper_id() -> str | None:
+    pid = st.session_state.current_paper_id
+    if pid and pid in st.session_state.papers:
+        return pid
+    if st.session_state.papers:
+        st.session_state.current_paper_id = next(iter(st.session_state.papers.keys()))
+        return st.session_state.current_paper_id
+    return None
+
+
+def _bind_current_paper_to_session_state() -> None:
+    pid = _ensure_current_paper_id()
+    if not pid:
+        return
+    paper = st.session_state.papers[pid]
+
+    st.session_state.pdf_bytes = paper["pdf_bytes"]
+    st.session_state.pdf_name = paper["pdf_name"]
+
+    st.session_state.paper_text = paper.get("paper_text", "")
+
+    st.session_state.reader_page_count = int(paper.get("reader_page_count", 0) or 0)
+    st.session_state.reader_current_page = int(
+        paper.get("reader_current_page", 1) or 1
+    )
+    st.session_state.reader_page_input = int(paper.get("reader_page_input", 1) or 1)
+    st.session_state.reader_nav_to_page = paper.get("reader_nav_to_page")
+
+    st.session_state.reader_page_text_cache = paper["reader_page_text_cache"]
+    st.session_state.reader_translation_cache = paper["reader_translation_cache"]
+    st.session_state.reader_page_image_cache = paper["reader_page_image_cache"]
+
+    st.session_state.analyze_table_markdown = paper.get("analyze_table_markdown", "")
+    st.session_state.analyze_max_chars = int(
+        paper.get("analyze_max_chars", st.session_state.get("analyze_max_chars", 14000))
+    )
+    st.session_state.reading_max_paper_chars = int(
+        paper.get(
+            "reading_max_paper_chars",
+            st.session_state.get("reading_max_paper_chars", 12000),
+        )
+    )
+
+    st.session_state.reading_structured_intent = paper.get(
+        "reading_structured_intent"
+    )
+    st.session_state.reading_last_recommendation = paper.get(
+        "reading_last_recommendation"
+    )
+
+
+def _persist_current_paper_from_session_state() -> None:
+    pid = _ensure_current_paper_id()
+    if not pid:
+        return
+    paper = st.session_state.papers[pid]
+
+    paper["pdf_bytes"] = st.session_state.pdf_bytes
+    paper["pdf_name"] = st.session_state.pdf_name
+    paper["paper_text"] = st.session_state.paper_text
+
+    paper["reader_page_count"] = st.session_state.reader_page_count
+    paper["reader_current_page"] = st.session_state.reader_current_page
+    paper["reader_page_input"] = st.session_state.reader_page_input
+    paper["reader_nav_to_page"] = st.session_state.reader_nav_to_page
+
+    paper["reader_page_text_cache"] = st.session_state.reader_page_text_cache
+    paper["reader_translation_cache"] = st.session_state.reader_translation_cache
+    paper["reader_page_image_cache"] = st.session_state.reader_page_image_cache
+
+    paper["analyze_table_markdown"] = st.session_state.analyze_table_markdown
+    paper["analyze_max_chars"] = int(
+        st.session_state.get("analyze_max_chars", paper.get("analyze_max_chars", 14000))
+    )
+    paper["reading_max_paper_chars"] = int(
+        st.session_state.get(
+            "reading_max_paper_chars",
+            paper.get("reading_max_paper_chars", 12000),
+        )
+    )
+
+    paper["reading_structured_intent"] = st.session_state.reading_structured_intent
+    paper["reading_last_recommendation"] = st.session_state.reading_last_recommendation
 
 
 def _render_analysis_result(data: dict) -> None:
@@ -280,6 +410,7 @@ def poll_background_jobs() -> None:
         elapsed_r = time.time() - float(st.session_state.reading_job_started_at or 0)
         if elapsed_r > MAX_READING_JOB_WAIT_SEC:
             st.session_state.reading_job_id = None
+            st.session_state.reading_job_paper_id = None
             st.session_state.reading_poll_ui = {}
             st.error("精读任务等待超时，请重试。")
             return
@@ -288,6 +419,7 @@ def poll_background_jobs() -> None:
                 r = client_s.get(f"{backend_url}/reading/job/{rid}")
             if r.status_code == 404:
                 st.session_state.reading_job_id = None
+                st.session_state.reading_job_paper_id = None
                 st.session_state.reading_poll_ui = {}
                 st.warning("精读任务已过期或不存在。")
                 return
@@ -315,6 +447,7 @@ def poll_background_jobs() -> None:
             elif status == "failed":
                 st.error(job.get("error") or "任务失败")
                 st.session_state.reading_job_id = None
+                st.session_state.reading_job_paper_id = None
                 st.session_state.reading_poll_ui = {}
             elif status == "done":
                 with httpx.Client(timeout=TIMEOUT_READING, trust_env=False) as client_l:
@@ -322,20 +455,51 @@ def poll_background_jobs() -> None:
                 if rr.status_code == 200:
                     body = rr.json()
                     st.session_state.reading_job_id = None
+                    target_pid = st.session_state.reading_job_paper_id
                     st.session_state.reading_poll_ui = {}
                     if kind == "structure":
-                        st.session_state.reading_structured_intent = body
-                        st.session_state.reading_last_recommendation = None
+                        if target_pid and target_pid in st.session_state.papers:
+                            st.session_state.papers[target_pid]["reading_structured_intent"] = body
+                            st.session_state.papers[target_pid]["reading_last_recommendation"] = None
+                            if target_pid == st.session_state.current_paper_id:
+                                st.session_state.reading_structured_intent = body
+                                st.session_state.reading_last_recommendation = None
+                        else:
+                            st.session_state.reading_structured_intent = body
+                            st.session_state.reading_last_recommendation = None
                     elif kind == "recommend":
-                        st.session_state.reading_last_recommendation = body
+                        if target_pid and target_pid in st.session_state.papers:
+                            st.session_state.papers[target_pid]["reading_last_recommendation"] = body
+                            if target_pid == st.session_state.current_paper_id:
+                                st.session_state.reading_last_recommendation = body
+                        else:
+                            st.session_state.reading_last_recommendation = body
                     elif kind == "advise":
-                        st.session_state.reading_structured_intent = body.get(
-                            "structured_intent"
-                        )
-                        st.session_state.reading_last_recommendation = {
-                            "recommendation": body.get("recommendation"),
-                            "paper_chars_used": body.get("paper_chars_used", 0),
-                        }
+                        if target_pid and target_pid in st.session_state.papers:
+                            st.session_state.papers[target_pid]["reading_structured_intent"] = body.get(
+                                "structured_intent"
+                            )
+                            st.session_state.papers[target_pid]["reading_last_recommendation"] = {
+                                "recommendation": body.get("recommendation"),
+                                "paper_chars_used": body.get("paper_chars_used", 0),
+                            }
+                            if target_pid == st.session_state.current_paper_id:
+                                st.session_state.reading_structured_intent = body.get(
+                                    "structured_intent"
+                                )
+                                st.session_state.reading_last_recommendation = {
+                                    "recommendation": body.get("recommendation"),
+                                    "paper_chars_used": body.get("paper_chars_used", 0),
+                                }
+                        else:
+                            st.session_state.reading_structured_intent = body.get(
+                                "structured_intent"
+                            )
+                            st.session_state.reading_last_recommendation = {
+                                "recommendation": body.get("recommendation"),
+                                "paper_chars_used": body.get("paper_chars_used", 0),
+                            }
+                    st.session_state.reading_job_paper_id = None
                     completed = True
                 else:
                     try:
@@ -344,6 +508,7 @@ def poll_background_jobs() -> None:
                         detail = rr.text
                     st.error(f"获取精读结果失败（HTTP {rr.status_code}）：{detail}")
                     st.session_state.reading_job_id = None
+                    st.session_state.reading_job_paper_id = None
                     st.session_state.reading_poll_ui = {}
             else:
                 st.session_state.reading_poll_ui = {}
@@ -533,59 +698,90 @@ st.caption(
     " **URL / arXiv** 可后续再加。"
 )
 
-uploaded = st.file_uploader("选择 PDF 文件", type=["pdf"], key="pdf_uploader")
+uploaded_files = st.file_uploader(
+    "选择 PDF 文件（可多选）", type=["pdf"], accept_multiple_files=True, key="pdf_uploader"
+)
 
 if st.button("抽取正文", key="btn_extract"):
-    if not uploaded:
+    if not uploaded_files:
         st.warning("请先选择 PDF 文件。")
     else:
-        file_bytes = uploaded.getvalue()
-        files = {
-            "file": (
-                uploaded.name,
-                file_bytes,
-                "application/pdf",
-            )
-        }
+        created_ids: list[str] = []
         post_url = f"{backend_url}/extract/file"
-        try:
-            with st.spinner("正在抽取 PDF…"):
-                with httpx.Client(timeout=TIMEOUT_EXTRACT, trust_env=False) as client:
+
+        with st.spinner("正在抽取 PDF 正文…"):
+            with httpx.Client(timeout=TIMEOUT_EXTRACT, trust_env=False) as client:
+                for uploaded in uploaded_files:
+                    file_bytes = uploaded.getvalue()
+                    paper_id = str(uuid.uuid4())
+                    st.session_state.papers[paper_id] = _new_paper_entry(
+                        paper_id=paper_id,
+                        pdf_name=uploaded.name,
+                        pdf_bytes=file_bytes,
+                    )
+                    created_ids.append(paper_id)
+
+                    files = {
+                        "file": (
+                            uploaded.name,
+                            file_bytes,
+                            "application/pdf",
+                        )
+                    }
                     r = client.post(post_url, files=files)
-            if r.status_code == 200:
-                data = r.json()
-                st.success(f"**pdf_quality**：{data.get('pdf_quality', '')}")
-                if data.get("warning"):
-                    st.warning(data["warning"])
-                text = data.get("text", "")
-                st.session_state.pdf_bytes = file_bytes
-                st.session_state.pdf_name = uploaded.name
-                st.session_state.reader_current_page = 1
-                st.session_state.reader_page_input = 1
-                st.session_state.reader_nav_to_page = None
-                st.session_state.reader_page_count = 0
-                st.session_state.reader_page_text_cache = {}
-                st.session_state.reader_translation_cache = {}
-                st.session_state.reader_page_image_cache = {}
-                st.session_state.paper_text = text
-                st.caption(
-                    f"共 **{len(text)}** 个字符（已保存到会话）；下方预览前 **{PREVIEW_CHARS}** 字。"
-                )
-                st.text_area("正文预览", value=text[:PREVIEW_CHARS], height=420)
-            else:
-                try:
-                    err = r.json()
-                    detail = err.get("detail", r.text)
-                except Exception:  # noqa: BLE001
-                    detail = r.text
-                _api_err("抽取 PDF", r.status_code, detail)
-        except httpx.RequestError as e:
-            st.error(
-                f"[抽取 PDF] 无法连接 `{post_url}`。请确认已运行 `uvicorn api.main:app --port 8000`。\n\n详情：{e}"
-            )
+                    if r.status_code != 200:
+                        try:
+                            err = r.json()
+                            detail = err.get("detail", r.text)
+                        except Exception:  # noqa: BLE001
+                            detail = r.text
+                        st.error(f"[抽取 PDF] {uploaded.name} 失败（HTTP {r.status_code}）：{detail}")
+                        continue
+
+                    data = r.json()
+                    if data.get("warning"):
+                        st.warning(f"[{uploaded.name}] {data['warning']}")
+
+                    text = data.get("text", "")
+                    paper = st.session_state.papers[paper_id]
+                    paper["paper_text"] = text
+                    inferred_len = len((text or "").strip())
+                    paper["analyze_max_chars"] = min(100000, max(2000, inferred_len))
+                    paper["reading_max_paper_chars"] = min(100000, max(2000, inferred_len))
+                    paper["reader_current_page"] = 1
+                    paper["reader_page_input"] = 1
+                    paper["reader_nav_to_page"] = None
+                    paper["reader_page_count"] = 0
+                    paper["reader_page_text_cache"] = {}
+                    paper["reader_translation_cache"] = {}
+                    paper["reader_page_image_cache"] = {}
+
+                    st.success(f"[{uploaded.name}] 抽取完成：共 {len(text)} 字")
+
+        if created_ids:
+            st.session_state.current_paper_id = created_ids[0]
+
+        _bind_current_paper_to_session_state()
+
+if st.session_state.papers:
+    paper_ids = list(st.session_state.papers.keys())
+    default_index = 0
+    if st.session_state.current_paper_id in paper_ids:
+        default_index = paper_ids.index(st.session_state.current_paper_id)
+    st.caption(f"已加载论文：{len(paper_ids)} 篇")
+    selected_id = st.radio(
+        "切换当前论文（用于阅读器/翻译/填表/精读）",
+        options=paper_ids,
+        index=default_index,
+        format_func=lambda pid: st.session_state.papers[pid]["pdf_name"],
+        key="current_paper_picker",
+    )
+    st.session_state.current_paper_id = selected_id
+    _bind_current_paper_to_session_state()
 
 if st.session_state.paper_text:
     st.caption(f"当前会话已缓存论文文本：**{len(st.session_state.paper_text)}** 字符。")
+    st.text_area("正文预览", value=st.session_state.paper_text[:PREVIEW_CHARS], height=420)
 
 st.divider()
 _jobs_open = bool(
@@ -780,11 +976,14 @@ def _tab_reader_panel_impl():
 
 
 
+    _persist_current_paper_from_session_state()
+
+
 def _tab_analyze_panel_impl():
-    st.subheader("全文分析（千问 · 流式生成）")
+    st.subheader("逐篇填表（9维度 Markdown 表格，流式生成）")
     st.caption(
-        "基于会话中的 **论文正文** 调用千问，生成概括、关键句点评与段落对照。"
-        " 默认 **流式生成**；若曾提交旧版异步任务，仍可在上方「后台任务」中轮询。"
+        "基于会话中的 **论文正文** 调用千问，按模板逐维度填写并只输出 Markdown 表格。"
+        " 默认 **流式生成**；若输出失败会提示回退或报错。"
         " 需 **OPENAI_API_KEY**。超长正文仅截取前 N 字（见下方）。"
     )
 
@@ -803,8 +1002,10 @@ def _tab_analyze_panel_impl():
         step=1000,
         key="analyze_max_chars",
     )
+    rendered_table_stream_this_run = False
+    rendered_review_stream_this_run = False
 
-    if st.button("生成全文分析", key="btn_analyze"):
+    if st.button("生成填表结果", key="btn_analyze"):
         if not st.session_state.paper_text.strip():
             st.warning("请先在上方抽取 PDF 正文，或自行粘贴到会话（当前为空）。")
         else:
@@ -816,13 +1017,13 @@ def _tab_analyze_panel_impl():
                 }
                 stream_slot = st.empty()
                 stream_text: list[str] = []
-                final_data = None
+                final_data: dict | None = None
                 stream_timeout = httpx.Timeout(connect=10.0, read=240.0, write=60.0, pool=10.0)
-                with st.spinner("正在流式生成全文分析…"):
+                with st.spinner("正在流式生成填表结果…"):
                     with httpx.Client(timeout=stream_timeout, trust_env=False) as client:
                         with client.stream(
                             "POST",
-                            f"{backend_url}/analyze/stream",
+                            f"{backend_url}/analyze/table/stream",
                             json=payload,
                         ) as r:
                             if r.status_code != 200:
@@ -834,7 +1035,8 @@ def _tab_analyze_panel_impl():
                                         piece = str(event.get("text", ""))
                                         if piece:
                                             stream_text.append(piece)
-                                            stream_slot.code("".join(stream_text), language="json")
+                                            stream_slot.markdown("".join(stream_text))
+                                            rendered_table_stream_this_run = True
                                     elif et == "final":
                                         final_data = event.get("data")
                                         break
@@ -842,17 +1044,79 @@ def _tab_analyze_panel_impl():
                                         st.error(f"[全文分析流式] {event.get('detail', '未知错误')}")
                                         break
                 if isinstance(final_data, dict):
-                    st.session_state.analyze_result = final_data
-                    st.success("全文分析完成。")
+                    st.session_state.analyze_table_markdown = str(
+                        final_data.get("table_markdown", "")
+                    )
+                    st.success("填表结果完成。")
             except httpx.RequestError as e:
                 st.error(f"[全文分析] 无法连接后端。详情：{e}")
 
-    analysis_data = st.session_state.analyze_result
-    if analysis_data:
-        with st.expander("分析结果", expanded=True):
-            _render_analysis_result(analysis_data)
+    if st.session_state.analyze_table_markdown and not rendered_table_stream_this_run:
+        with st.expander("填表结果（Markdown 表格）", expanded=True):
+            st.markdown(st.session_state.analyze_table_markdown)
+
+    # 综合综述：基于所有已填表论文
+    available_tables: list[str] = []
+    for pid in st.session_state.papers.keys():
+        table_md = st.session_state.papers[pid].get("analyze_table_markdown", "")
+        if table_md and str(table_md).strip():
+            available_tables.append(str(table_md))
+
+    if len(available_tables) >= 2:
+        if st.button("生成综合文献综述", key="btn_review"):
+            try:
+                stream_slot = st.empty()
+                stream_text = []
+                final_data: dict | None = None
+                review_timeout = httpx.Timeout(connect=10.0, read=240.0, write=60.0, pool=10.0)
+                with st.spinner("正在流式生成综合文献综述…"):
+                    with httpx.Client(timeout=review_timeout, trust_env=False) as client:
+                        with client.stream(
+                            "POST",
+                            f"{backend_url}/review/stream",
+                            json={"tables": available_tables},
+                        ) as r:
+                            if r.status_code != 200:
+                                _api_err("综合综述", r.status_code, _http_detail(r))
+                            else:
+                                for event in _iter_ndjson_events(r):
+                                    et = event.get("type")
+                                    if et == "delta":
+                                        piece = str(event.get("text", ""))
+                                        if piece:
+                                            stream_text.append(piece)
+                                            with stream_slot.container(border=True):
+                                                st.markdown("".join(stream_text))
+                                            rendered_review_stream_this_run = True
+                                    elif et == "final":
+                                        final_data = event.get("data")
+                                        break
+                                    elif et == "error":
+                                        st.error(f"[综合综述流式] {event.get('detail', '未知错误')}")
+                                        break
+                if isinstance(final_data, dict):
+                    st.session_state.review_markdown = str(
+                        final_data.get("review_markdown", "")
+                    )
+                    st.success("综合文献综述完成。")
+            except httpx.RequestError as e:
+                st.error(f"[综合综述] 无法连接后端。详情：{e}")
+
+    if st.session_state.review_markdown and not rendered_review_stream_this_run:
+        with st.expander("综合文献综述（Markdown）", expanded=False):
+            with st.container(border=True):
+                st.markdown(st.session_state.review_markdown)
+            st.download_button(
+                label="下载综述 Markdown",
+                data=str(st.session_state.review_markdown).encode("utf-8"),
+                file_name="paperpilot_review.md",
+                mime="text/markdown",
+                key="download_review_md",
+            )
 
 
+
+    _persist_current_paper_from_session_state()
 
 def _tab_reading_panel_impl():
     st.subheader("精读建议（千问 · 结构化需求）")
@@ -901,6 +1165,7 @@ def _tab_reading_panel_impl():
                     st.session_state.reading_job_id = r.json().get("job_id")
                     st.session_state.reading_job_kind = "structure"
                     st.session_state.reading_job_started_at = time.time()
+                    st.session_state.reading_job_paper_id = st.session_state.current_paper_id
                     st.success("已提交结构化任务…")
                     st.rerun()
                 else:
@@ -1014,6 +1279,8 @@ def _tab_reading_panel_impl():
         with st.expander("当前会话中的结构化需求", expanded=False):
             st.json(st.session_state.reading_structured_intent)
 
+    _persist_current_paper_from_session_state()
+
 
 _tab_reader_panel = _maybe_fragment(_tab_reader_panel_impl)
 _tab_analyze_panel = _maybe_fragment(_tab_analyze_panel_impl)
@@ -1030,4 +1297,5 @@ with tab_analyze:
 with tab_reading:
     _tab_reading_panel()
 
+_persist_current_paper_from_session_state()
 poll_background_jobs()
