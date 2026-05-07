@@ -1,20 +1,42 @@
 """Lightweight translation routes."""
 
+from collections.abc import Iterator
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from models.translate import TranslateRequest, TranslateResponse
 from models.translate_job import TranslateJobStatusResponse, TranslateJobSubmitResponse
 from services.llm import LLMConfigError
-from services.translate_core import translate_to_zh
+from services.translate_core import TRANSLATE_SYSTEM, translate_to_zh
+from services import llm
 from services.task_store import start_translate_job, translate_job_store
 
 router = APIRouter(tags=["translate"])
+
+
+def _translate_stream(req: TranslateRequest) -> Iterator[bytes]:
+    user_msg = f"mode={req.mode}\n\n原文：\n{req.text}"
+    for piece in llm.chat_text_stream(TRANSLATE_SYSTEM, user_msg):
+        if piece:
+            yield piece.encode("utf-8")
 
 
 @router.post("/translate", response_model=TranslateResponse)
 def post_translate(body: TranslateRequest) -> TranslateResponse:
     try:
         return TranslateResponse(zh=translate_to_zh(body))
+    except LLMConfigError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.post("/translate/stream")
+def post_translate_stream(body: TranslateRequest) -> StreamingResponse:
+    try:
+        return StreamingResponse(_translate_stream(body), media_type="text/plain; charset=utf-8")
     except LLMConfigError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     except ValueError as e:

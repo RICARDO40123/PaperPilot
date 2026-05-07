@@ -223,6 +223,30 @@ def _api_err(component: str, status: int, detail: str) -> None:
     st.error(f"[{component}] HTTP {status}：{detail}")
 
 
+def _render_page_like_html(text: str, height: int = 780) -> str:
+    safe = escape(text or "—")
+    return f"""
+<div style="
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 22px 26px;
+    min-height: {height}px;
+    max-height: {height}px;
+    overflow: auto;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+">
+  <div style="
+      white-space: pre-wrap;
+      line-height: 1.8;
+      font-size: 16px;
+      color: #222;
+      font-family: 'Times New Roman', 'Noto Serif SC', serif;
+  ">{safe}</div>
+</div>
+"""
+
+
 def poll_background_jobs() -> None:
     """在整页控件渲染完成后调用：统一轮询翻译/分析/精读任务，最多一次 sleep + rerun。"""
     need_wait = False
@@ -654,26 +678,86 @@ with tab_reader:
                 st.warning("当前页未抽取到可用文本（可能是扫描页或图片页）。")
             else:
                 page_cache_key = f"page::{st.session_state.reader_current_page}"
+                rendered_stream_this_run = False
                 if st.button("翻译本页", key="btn_translate_page"):
-                    try:
-                        with st.spinner("正在提交翻译任务…"):
-                            with httpx.Client(timeout=30.0, trust_env=False) as client:
-                                r = client.post(
-                                    f"{backend_url}/translate/submit",
+                    slot = st.empty()
+                    pieces: list[str] = []
+                    flush_chars = 40
+                    staged = ""
+                    stream_timeout = httpx.Timeout(connect=10.0, read=180.0, write=60.0, pool=10.0)
+                    fallback_timeout = httpx.Timeout(connect=10.0, read=240.0, write=60.0, pool=10.0)
+
+                    def _fallback_once() -> None:
+                        with st.spinner("正在回退为一次性翻译…"):
+                            with httpx.Client(timeout=fallback_timeout, trust_env=False) as client:
+                                resp = client.post(
+                                    f"{backend_url}/translate",
                                     json={"text": page_text, "mode": "page"},
                                 )
-                        if r.status_code == 200:
-                            st.session_state.reader_translate_job_id = r.json().get("job_id")
-                            st.session_state.reader_translate_job_started_at = time.time()
-                            st.session_state.reader_translate_cache_key = page_cache_key
-                            st.success("已提交翻译任务…")
-                            st.rerun()
+                        if resp.status_code == 200:
+                            final_zh = str(resp.json().get("zh", "")).strip()
+                            if final_zh:
+                                st.session_state.reader_translation_cache[page_cache_key] = final_zh
+                                st.success("翻译完成（回退模式）。")
+                            else:
+                                st.warning("回退翻译返回为空。")
                         else:
-                            _api_err("翻译本页", r.status_code, _http_detail(r))
-                    except httpx.RequestError as e:
-                        st.error(f"[翻译本页] 无法连接后端。详情：{e}")
+                            _api_err("翻译本页（回退）", resp.status_code, _http_detail(resp))
 
-                if st.session_state.reader_translation_cache.get(page_cache_key):
+                    try:
+                        with st.spinner("正在流式翻译本页…"):
+                            with httpx.Client(timeout=stream_timeout, trust_env=False) as client:
+                                with client.stream(
+                                    "POST",
+                                    f"{backend_url}/translate/stream",
+                                    json={"text": page_text, "mode": "page"},
+                                ) as stream_resp:
+                                    if stream_resp.status_code != 200:
+                                        detail = _http_detail(stream_resp)
+                                        raise RuntimeError(
+                                            f"流式接口失败（HTTP {stream_resp.status_code}）：{detail}"
+                                        )
+                                    for chunk in stream_resp.iter_text():
+                                        if not chunk:
+                                            continue
+                                        pieces.append(chunk)
+                                        staged += chunk
+                                        if len(staged) >= flush_chars:
+                                            slot.markdown(
+                                                _render_page_like_html("".join(pieces)),
+                                                unsafe_allow_html=True,
+                                            )
+                                            rendered_stream_this_run = True
+                                            staged = ""
+                        if staged:
+                            slot.markdown(
+                                _render_page_like_html("".join(pieces)),
+                                unsafe_allow_html=True,
+                            )
+                            rendered_stream_this_run = True
+                        final_zh = "".join(pieces).strip()
+                        if final_zh:
+                            st.session_state.reader_translation_cache[page_cache_key] = final_zh
+                            st.success("流式翻译完成。")
+                        else:
+                            st.warning("流式翻译未返回内容。")
+                    except httpx.RequestError as e:
+                        st.warning(f"流式翻译不可用，回退一次性接口。详情：{e}")
+                        try:
+                            _fallback_once()
+                        except httpx.RequestError as ee:
+                            st.error(f"[翻译本页（回退）] 无法连接后端。详情：{ee}")
+                    except RuntimeError as e:
+                        st.warning(f"{e}，回退一次性接口。")
+                        try:
+                            _fallback_once()
+                        except httpx.RequestError as ee:
+                            st.error(f"[翻译本页（回退）] 无法连接后端。详情：{ee}")
+
+                if (
+                    st.session_state.reader_translation_cache.get(page_cache_key)
+                    and not rendered_stream_this_run
+                ):
                     _render_page_like(
                         st.session_state.reader_translation_cache.get(page_cache_key, "")
                     )

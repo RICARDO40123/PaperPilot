@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Iterator
 from typing import Any
 
 try:
@@ -61,6 +62,45 @@ def chat_text(system: str, user: str) -> str:
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"OpenAI 兼容接口调用失败：{e}") from e
     return _message_content(resp)
+
+
+def chat_text_stream(system: str, user: str) -> Iterator[str]:
+    """流式对话，逐块产出助手文本。"""
+    client = _require_client()
+    model = _default_model()
+    try:
+        stream = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            stream=True,
+        )
+        for chunk in stream:
+            choices = getattr(chunk, "choices", None)
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            if delta is None:
+                continue
+            part = getattr(delta, "content", None)
+            if not part:
+                continue
+            if isinstance(part, str):
+                yield part
+                continue
+            if isinstance(part, list):
+                for item in part:
+                    text = getattr(item, "text", None)
+                    if text:
+                        yield str(text)
+                    elif isinstance(item, dict):
+                        maybe = item.get("text")
+                        if maybe:
+                            yield str(maybe)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"OpenAI 兼容流式接口调用失败：{e}") from e
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
