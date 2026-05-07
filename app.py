@@ -2,6 +2,7 @@
 
 import os
 import time
+import json
 from html import escape
 
 import httpx
@@ -245,6 +246,16 @@ def _render_page_like_html(text: str, height: int = 780) -> str:
   ">{safe}</div>
 </div>
 """
+
+
+def _iter_ndjson_events(resp: httpx.Response):
+    for line in resp.iter_lines():
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError:
+            continue
 
 
 def poll_background_jobs() -> None:
@@ -797,17 +808,36 @@ with tab_analyze:
                     "mode": analyze_mode,
                     "max_input_chars": int(analyze_cap),
                 }
-                with st.spinner("正在提交全文分析任务…"):
-                    with httpx.Client(timeout=30.0, trust_env=False) as client:
-                        r = client.post(f"{backend_url}/analyze/submit", json=payload)
-                if r.status_code == 200:
-                    body = r.json()
-                    st.session_state.analyze_job_id = body.get("job_id")
-                    st.session_state.analyze_job_started_at = time.time()
-                    st.success("已提交分析任务，正在排队/执行…")
-                    st.rerun()
-                else:
-                    _api_err("全文分析", r.status_code, _http_detail(r))
+                stream_slot = st.empty()
+                stream_text: list[str] = []
+                final_data = None
+                stream_timeout = httpx.Timeout(connect=10.0, read=240.0, write=60.0, pool=10.0)
+                with st.spinner("正在流式生成全文分析…"):
+                    with httpx.Client(timeout=stream_timeout, trust_env=False) as client:
+                        with client.stream(
+                            "POST",
+                            f"{backend_url}/analyze/stream",
+                            json=payload,
+                        ) as r:
+                            if r.status_code != 200:
+                                _api_err("全文分析", r.status_code, _http_detail(r))
+                            else:
+                                for event in _iter_ndjson_events(r):
+                                    et = event.get("type")
+                                    if et == "delta":
+                                        piece = str(event.get("text", ""))
+                                        if piece:
+                                            stream_text.append(piece)
+                                            stream_slot.code("".join(stream_text), language="json")
+                                    elif et == "final":
+                                        final_data = event.get("data")
+                                        break
+                                    elif et == "error":
+                                        st.error(f"[全文分析流式] {event.get('detail', '未知错误')}")
+                                        break
+                if isinstance(final_data, dict):
+                    st.session_state.analyze_result = final_data
+                    st.success("全文分析完成。")
             except httpx.RequestError as e:
                 st.error(f"[全文分析] 无法连接后端。详情：{e}")
 
@@ -880,20 +910,36 @@ with tab_reading:
                     "paper_text": st.session_state.paper_text,
                     "max_paper_chars": int(max_chars),
                 }
-                with st.spinner("正在提交精读建议任务…"):
-                    with httpx.Client(timeout=30.0, trust_env=False) as client:
-                        r = client.post(
-                            f"{backend_url}/reading/recommend/submit",
+                stream_slot = st.empty()
+                stream_text: list[str] = []
+                final_data = None
+                stream_timeout = httpx.Timeout(connect=10.0, read=240.0, write=60.0, pool=10.0)
+                with st.spinner("正在流式生成精读建议…"):
+                    with httpx.Client(timeout=stream_timeout, trust_env=False) as client:
+                        with client.stream(
+                            "POST",
+                            f"{backend_url}/reading/recommend/stream",
                             json=payload,
-                        )
-                if r.status_code == 200:
-                    st.session_state.reading_job_id = r.json().get("job_id")
-                    st.session_state.reading_job_kind = "recommend"
-                    st.session_state.reading_job_started_at = time.time()
-                    st.success("已提交精读建议任务…")
-                    st.rerun()
-                else:
-                    _api_err("精读建议", r.status_code, _http_detail(r))
+                        ) as r:
+                            if r.status_code != 200:
+                                _api_err("精读建议", r.status_code, _http_detail(r))
+                            else:
+                                for event in _iter_ndjson_events(r):
+                                    et = event.get("type")
+                                    if et == "delta":
+                                        piece = str(event.get("text", ""))
+                                        if piece:
+                                            stream_text.append(piece)
+                                            stream_slot.code("".join(stream_text), language="json")
+                                    elif et == "final":
+                                        final_data = event.get("data")
+                                        break
+                                    elif et == "error":
+                                        st.error(f"[精读建议流式] {event.get('detail', '未知错误')}")
+                                        break
+                if isinstance(final_data, dict):
+                    st.session_state.reading_last_recommendation = final_data
+                    st.success("精读建议完成。")
             except httpx.RequestError as e:
                 st.error(f"[精读建议] 无法连接后端。详情：{e}")
 
@@ -902,24 +948,48 @@ with tab_reading:
             st.warning("请先填写阅读动机/需求。")
         else:
             try:
-                with st.spinner("正在提交一键精读任务…"):
-                    with httpx.Client(timeout=30.0, trust_env=False) as client:
-                        r = client.post(
-                            f"{backend_url}/reading/advise/submit",
+                stream_slot = st.empty()
+                stream_text: list[str] = []
+                final_data = None
+                stream_timeout = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
+                with st.spinner("正在流式执行一键精读…"):
+                    with httpx.Client(timeout=stream_timeout, trust_env=False) as client:
+                        with client.stream(
+                            "POST",
+                            f"{backend_url}/reading/advise/stream",
                             json={
                                 "user_prompt": user_prompt.strip(),
                                 "paper_text": st.session_state.paper_text,
                                 "max_paper_chars": int(max_chars),
                             },
-                        )
-                if r.status_code == 200:
-                    st.session_state.reading_job_id = r.json().get("job_id")
-                    st.session_state.reading_job_kind = "advise"
-                    st.session_state.reading_job_started_at = time.time()
-                    st.success("已提交一键任务…")
-                    st.rerun()
-                else:
-                    _api_err("一键精读", r.status_code, _http_detail(r))
+                        ) as r:
+                            if r.status_code != 200:
+                                _api_err("一键精读", r.status_code, _http_detail(r))
+                            else:
+                                for event in _iter_ndjson_events(r):
+                                    et = event.get("type")
+                                    if et == "stage" and event.get("name") == "structured_intent_ready":
+                                        data = event.get("data")
+                                        if isinstance(data, dict):
+                                            st.session_state.reading_structured_intent = data
+                                    elif et == "delta":
+                                        piece = str(event.get("text", ""))
+                                        if piece:
+                                            stream_text.append(piece)
+                                            stream_slot.code("".join(stream_text), language="json")
+                                    elif et == "final":
+                                        final_data = event.get("data")
+                                        break
+                                    elif et == "error":
+                                        st.error(f"[一键精读流式] {event.get('detail', '未知错误')}")
+                                        break
+                if isinstance(final_data, dict):
+                    st.session_state.reading_structured_intent = final_data.get("structured_intent")
+                    st.session_state.reading_last_recommendation = {
+                        "recommendation": final_data.get("recommendation"),
+                        "paper_chars_used": final_data.get("paper_chars_used", 0),
+                    }
+                    st.success("一键精读完成。")
             except httpx.RequestError as e:
                 st.error(f"[一键精读] 无法连接后端。详情：{e}")
 

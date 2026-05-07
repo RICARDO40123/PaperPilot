@@ -77,6 +77,50 @@ def run_analyze(req: AnalyzeRequest) -> AnalyzeResponse:
     return resp
 
 
+def build_analyze_user_message(req: AnalyzeRequest) -> tuple[str, int, bool]:
+    raw = req.paper_text or ""
+    if len(raw.strip()) < 20:
+        raise ValueError("论文文本过短，请先抽取正文。")
+    cap = max(2000, min(req.max_input_chars, len(raw)))
+    excerpt = raw[:cap].strip()
+    truncated = len(raw) > len(excerpt)
+    ks_max, pp_max = _limits(req.mode)
+    mode_hint = (
+        f"mode={req.mode}：key_sentences 至多 {ks_max} 条；"
+        f"paragraph_pairs 至多 {pp_max} 对；段落意思连贯优先。"
+    )
+    user_msg = (
+        f"{mode_hint}\n\n"
+        f"论文摘录（共 {len(excerpt)} 字符）：\n---\n{excerpt}\n---"
+    )
+    return user_msg, len(excerpt), truncated
+
+
+def parse_analyze_raw(raw_text: str, req: AnalyzeRequest, excerpt_len: int, truncated: bool) -> AnalyzeResponse:
+    data = llm.extract_json_object(raw_text)
+    try:
+        resp = AnalyzeResponse.model_validate(data)
+    except Exception:  # noqa: BLE001
+        try:
+            resp = AnalyzeResponse.model_validate(coerce_relaxed_dict(data))
+        except Exception as e2:  # noqa: BLE001
+            raise ValueError(
+                f"模型 JSON 与契约不匹配：{e2}\n原始键：{list(data.keys())}"
+            ) from e2
+
+    ks_max, pp_max = _limits(req.mode)
+    resp.key_sentences = resp.key_sentences[:ks_max]
+    resp.paragraph_pairs = resp.paragraph_pairs[:pp_max]
+    if truncated:
+        raw_len = len(req.paper_text or "")
+        resp.truncation_note = (
+            f"本次分析仅基于论文正文前 {excerpt_len} 个字符；全文共 {raw_len} 字符。"
+        )
+    else:
+        resp.truncation_note = ""
+    return resp
+
+
 def coerce_relaxed_dict(data: dict) -> dict:
     """补齐缺失键，便于降级校验。"""
     defaults = {

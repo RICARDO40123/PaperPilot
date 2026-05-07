@@ -1,8 +1,10 @@
 """Structured intent + deep-read recommendation (Qwen via DashScope)."""
 
+import json
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from models.intent import StructuredReadingIntent
 from models.reading_api import (
@@ -15,13 +17,21 @@ from models.reading_api import (
 from models.reading_job import ReadingJobStatusResponse, ReadingJobSubmitResponse
 from services.llm import LLMConfigError
 from services.reading_pipeline import (
+    RECOMMEND_SYSTEM,
+    build_recommend_user_message,
+    parse_recommend_raw,
     recommend_deep_read,
     run_pipeline,
     structure_user_intent,
 )
+from services import llm
 from services.task_store import reading_job_store, start_reading_job
 
 router = APIRouter(prefix="/reading", tags=["reading"])
+
+
+def _stream_event(payload: dict) -> bytes:
+    return (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 @router.post("/structure-intent", response_model=StructuredReadingIntent)
@@ -53,6 +63,30 @@ def post_recommend(body: RecommendReadingRequest) -> RecommendReadingResponse:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
 
+@router.post("/recommend/stream")
+def post_recommend_stream(body: RecommendReadingRequest) -> StreamingResponse:
+    def _gen() -> Any:
+        try:
+            user_msg, used = build_recommend_user_message(
+                body.structured_intent,
+                body.paper_text,
+                body.max_paper_chars,
+            )
+            pieces: list[str] = []
+            for chunk in llm.chat_text_stream(RECOMMEND_SYSTEM, user_msg):
+                if not chunk:
+                    continue
+                pieces.append(chunk)
+                yield _stream_event({"type": "delta", "text": chunk})
+            rec = parse_recommend_raw("".join(pieces))
+            resp = RecommendReadingResponse(recommendation=rec, paper_chars_used=used)
+            yield _stream_event({"type": "final", "data": resp.model_dump()})
+        except Exception as e:  # noqa: BLE001
+            yield _stream_event({"type": "error", "detail": str(e)})
+
+    return StreamingResponse(_gen(), media_type="application/x-ndjson; charset=utf-8")
+
+
 @router.post("/advise", response_model=ReadingPipelineResponse)
 def post_advise(body: ReadingAdviseRequest) -> ReadingPipelineResponse:
     try:
@@ -67,6 +101,42 @@ def post_advise(body: ReadingAdviseRequest) -> ReadingPipelineResponse:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@router.post("/advise/stream")
+def post_advise_stream(body: ReadingAdviseRequest) -> StreamingResponse:
+    def _gen() -> Any:
+        try:
+            structured = structure_user_intent(body.user_prompt)
+            yield _stream_event(
+                {
+                    "type": "stage",
+                    "name": "structured_intent_ready",
+                    "data": structured.model_dump(),
+                }
+            )
+            user_msg, used = build_recommend_user_message(
+                structured,
+                body.paper_text,
+                body.max_paper_chars,
+            )
+            pieces: list[str] = []
+            for chunk in llm.chat_text_stream(RECOMMEND_SYSTEM, user_msg):
+                if not chunk:
+                    continue
+                pieces.append(chunk)
+                yield _stream_event({"type": "delta", "text": chunk})
+            rec = parse_recommend_raw("".join(pieces))
+            resp = ReadingPipelineResponse(
+                structured_intent=structured,
+                recommendation=rec,
+                paper_chars_used=used,
+            )
+            yield _stream_event({"type": "final", "data": resp.model_dump()})
+        except Exception as e:  # noqa: BLE001
+            yield _stream_event({"type": "error", "detail": str(e)})
+
+    return StreamingResponse(_gen(), media_type="application/x-ndjson; charset=utf-8")
 
 
 # --- Async jobs (submit + poll + result) ---

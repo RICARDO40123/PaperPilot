@@ -76,6 +76,29 @@ def recommend_deep_read(
     return ReadingRecommendation.model_validate(data), len(excerpt)
 
 
+def build_recommend_user_message(
+    structured: StructuredReadingIntent,
+    paper_text: str,
+    max_paper_chars: int,
+) -> tuple[str, int]:
+    excerpt = (paper_text or "")[: max(0, max_paper_chars)]
+    structured_block = json.dumps(
+        structured.model_dump(), ensure_ascii=False, indent=2
+    )
+    user_msg = (
+        "以下为**结构化用户需求**（唯一意图依据）：\n"
+        f"{structured_block}\n\n"
+        "以下为**论文摘录**（可能不完整）：\n"
+        f"{excerpt}"
+    )
+    return user_msg, len(excerpt)
+
+
+def parse_recommend_raw(raw_text: str) -> ReadingRecommendation:
+    data = llm.extract_json_object(raw_text)
+    return ReadingRecommendation.model_validate(data)
+
+
 def run_pipeline(
     user_prompt: str,
     paper_text: str = "",
