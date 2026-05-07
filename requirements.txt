@@ -2,7 +2,7 @@
 # conda 激活你的环境后: pip install -r requirements.txt
 
 # --- Web ---
-streamlit>=1.31.0
+streamlit>=1.33.0
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 python-multipart>=0.0.9

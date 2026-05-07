@@ -258,6 +258,14 @@ def _iter_ndjson_events(resp: httpx.Response):
             continue
 
 
+def _maybe_fragment(func):
+    """若 Streamlit 支持 st.fragment，则仅重跑片段内控件，减轻整页灰态残影。"""
+    deco = getattr(st, "fragment", None)
+    if deco is not None:
+        return deco(func)
+    return func
+
+
 def poll_background_jobs() -> None:
     """在整页控件渲染完成后调用：统一轮询翻译/分析/精读任务，最多一次 sleep + rerun。"""
     need_wait = False
@@ -602,13 +610,11 @@ with st.expander("后台任务状态（全局，页末统一轮询）", expanded
     if not _jobs_open:
         st.caption("当前无进行中的后台任务。")
 
-tab_reader, tab_analyze, tab_reading = st.tabs(["双栏阅读器", "全文分析", "精读建议"])
-
-with tab_reader:
+def _tab_reader_panel_impl():
     st.subheader("双栏阅读器（纯 Python：左图右译）")
     st.caption(
         "左侧按页渲染 PDF 图片，右侧显示整页中文翻译（页面阅读样式）。"
-        " 「翻译本页」为后台任务 + 轮询，避免长时间卡住界面。"
+        " 「翻译本页」为**流式输出**；亦可使用下方全局后台任务轮询查看旧式异步翻译。"
         " 若为扫描版 PDF，整页文本抽取可能较弱。"
     )
 
@@ -765,21 +771,21 @@ with tab_reader:
                         except httpx.RequestError as ee:
                             st.error(f"[翻译本页（回退）] 无法连接后端。详情：{ee}")
 
-                if (
-                    st.session_state.reader_translation_cache.get(page_cache_key)
-                    and not rendered_stream_this_run
-                ):
-                    _render_page_like(
-                        st.session_state.reader_translation_cache.get(page_cache_key, "")
-                    )
+                cached_zh = st.session_state.reader_translation_cache.get(page_cache_key)
+                if cached_zh:
+                    if not rendered_stream_this_run:
+                        _render_page_like(cached_zh)
                 else:
                     st.info("点击“翻译本页”后，这里会显示与左侧对应的整页中文内容。")
 
-with tab_analyze:
-    st.subheader("全文分析（千问 · 异步任务）")
+
+
+def _tab_analyze_panel_impl():
+    st.subheader("全文分析（千问 · 流式生成）")
     st.caption(
         "基于会话中的 **论文正文** 调用千问，生成概括、关键句点评与段落对照。"
-        " 提交后后台执行，页面会轮询状态；需 **OPENAI_API_KEY**。超长正文仅截取前 N 字（见下方）。"
+        " 默认 **流式生成**；若曾提交旧版异步任务，仍可在上方「后台任务」中轮询。"
+        " 需 **OPENAI_API_KEY**。超长正文仅截取前 N 字（见下方）。"
     )
 
     analyze_mode = st.radio(
@@ -846,12 +852,14 @@ with tab_analyze:
         with st.expander("分析结果", expanded=True):
             _render_analysis_result(analysis_data)
 
-with tab_reading:
+
+
+def _tab_reading_panel_impl():
     st.subheader("精读建议（千问 · 结构化需求）")
     st.caption(
         "流程：**自然语言 → 结构化 JSON（唯一意图依据）→ 结合论文摘录给出是否精读**。"
         " 后续推理**不直接使用**你的原始句子，只使用结构化结果。"
-        " 以下为后台任务 + 轮询，避免长时间卡住界面。"
+        " 「生成精读建议 / 一键」为 **流式输出**；「结构化需求」仍可走异步任务 + 上方轮询。"
         " 需在 `.env` 配置 **OPENAI_API_KEY**（可配合 DashScope 兼容模式），并 `pip install openai`。"
     )
 
@@ -1005,5 +1013,21 @@ with tab_reading:
     if st.session_state.reading_structured_intent and not (do_structure or do_pipeline):
         with st.expander("当前会话中的结构化需求", expanded=False):
             st.json(st.session_state.reading_structured_intent)
+
+
+_tab_reader_panel = _maybe_fragment(_tab_reader_panel_impl)
+_tab_analyze_panel = _maybe_fragment(_tab_analyze_panel_impl)
+_tab_reading_panel = _maybe_fragment(_tab_reading_panel_impl)
+
+tab_reader, tab_analyze, tab_reading = st.tabs(["双栏阅读器", "全文分析", "精读建议"])
+
+with tab_reader:
+    _tab_reader_panel()
+
+with tab_analyze:
+    _tab_analyze_panel()
+
+with tab_reading:
+    _tab_reading_panel()
 
 poll_background_jobs()
