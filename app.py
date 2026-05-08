@@ -4,6 +4,7 @@ import os
 import time
 import json
 import uuid
+import re
 from html import escape
 
 import httpx
@@ -26,6 +27,9 @@ MAX_ANALYZE_JOB_WAIT_SEC = 600.0
 MAX_TRANSLATE_JOB_WAIT_SEC = 600.0
 MAX_READING_JOB_WAIT_SEC = 600.0
 PREVIEW_CHARS = 8000
+WAITING_VOCAB_DEFAULT_COUNT = 6
+WAITING_VOCAB_TOPN = 120
+IELTS_WORD_XLS_PATH = os.path.join("IELTSword", "ielts", "ielts.xls")
 
 st.set_page_config(page_title="PaperPilot", layout="wide")
 st.title("PaperPilot")
@@ -96,6 +100,12 @@ if "papernote_markdown" not in st.session_state:
     st.session_state.papernote_markdown = ""
 if "papernote_just_generated" not in st.session_state:
     st.session_state.papernote_just_generated = False
+if "waiting_vocab_cards" not in st.session_state:
+    st.session_state.waiting_vocab_cards = []
+if "waiting_vocab_offset" not in st.session_state:
+    st.session_state.waiting_vocab_offset = 0
+if "waiting_vocab_show_count" not in st.session_state:
+    st.session_state.waiting_vocab_show_count = WAITING_VOCAB_DEFAULT_COUNT
 
 
 def _new_paper_entry(
@@ -128,6 +138,8 @@ def _new_paper_entry(
         "reading_last_recommendation": None,
         "analyze_max_chars": analyze_default,
         "reading_max_paper_chars": reading_default,
+        "waiting_vocab_cards": [],
+        "waiting_vocab_offset": 0,
     }
 
 
@@ -181,6 +193,8 @@ def _bind_current_paper_to_session_state() -> None:
     st.session_state.reading_last_recommendation = paper.get(
         "reading_last_recommendation"
     )
+    st.session_state.waiting_vocab_cards = list(paper.get("waiting_vocab_cards", []))
+    st.session_state.waiting_vocab_offset = int(paper.get("waiting_vocab_offset", 0) or 0)
 
 
 def _persist_current_paper_from_session_state() -> None:
@@ -233,6 +247,8 @@ def _persist_current_paper_from_session_state() -> None:
 
     paper["reading_structured_intent"] = st.session_state.reading_structured_intent
     paper["reading_last_recommendation"] = st.session_state.reading_last_recommendation
+    paper["waiting_vocab_cards"] = list(st.session_state.get("waiting_vocab_cards", []))
+    paper["waiting_vocab_offset"] = int(st.session_state.get("waiting_vocab_offset", 0) or 0)
 
 
 def _current_paper_filename_prefix() -> str:
@@ -248,6 +264,146 @@ def _safe_name_stem(name: str) -> str:
     stem = os.path.splitext(str(name).strip())[0]
     stem = stem.replace(" ", "_")
     return stem or "paper"
+
+
+def _looks_like_word(cell: str) -> bool:
+    s = str(cell or "").strip()
+    if not s:
+        return False
+    # accept single words and multi-word phrases
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z' -]{0,80}", s))
+
+
+def _normalize_word(word: str) -> str:
+    w = re.sub(r"\s+", " ", str(word or "").strip().lower())
+    return re.sub(r"[^a-z' -]", "", w)
+
+
+def _load_ielts_vocab() -> dict[str, dict]:
+    try:
+        xlrd = __import__("xlrd")
+    except Exception:
+        return {}
+    path = os.path.join(os.getcwd(), IELTS_WORD_XLS_PATH)
+    if not os.path.exists(path):
+        return {}
+    try:
+        wb = xlrd.open_workbook(path)
+    except Exception:
+        # Some legacy xls files need GBK override.
+        wb = xlrd.open_workbook(path, encoding_override="cp936")
+    if wb.nsheets <= 0:
+        return {}
+    sh = wb.sheet_by_index(0)
+    if sh.nrows <= 0 or sh.ncols <= 0:
+        return {}
+
+    english_cols: list[int] = []
+    sample_rows = min(sh.nrows, 150)
+    for c in range(sh.ncols):
+        hits = 0
+        total = 0
+        for r in range(sample_rows):
+            v = str(sh.cell_value(r, c)).strip()
+            if not v:
+                continue
+            total += 1
+            if _looks_like_word(v):
+                hits += 1
+        if total >= 8 and hits / max(total, 1) >= 0.55:
+            english_cols.append(c)
+
+    vocab: dict[str, dict] = {}
+    for c in english_cols:
+        m_col = c + 1
+        if m_col >= sh.ncols:
+            continue
+        for r in range(sh.nrows):
+            raw_word = str(sh.cell_value(r, c)).strip()
+            if not _looks_like_word(raw_word):
+                continue
+            word = _normalize_word(raw_word)
+            if not word:
+                continue
+            meaning = str(sh.cell_value(r, m_col)).strip()
+            # If no meaning cell exists, still keep the word.
+            pos_matches = re.findall(r"\b(?:n|v|vt|vi|adj|adv|prep|conj|pron|aux|num|art|int)\.", meaning)
+            pos = " / ".join(sorted(set(pos_matches))) if pos_matches else "—"
+            zh = re.sub(r"\b(?:n|v|vt|vi|adj|adv|prep|conj|pron|aux|num|art|int)\.", "", meaning).strip(" ;,，；")
+            if not zh:
+                zh = meaning if meaning else "—"
+            collocation = raw_word.strip() if " " in raw_word.strip() else "—"
+            vocab[word] = {
+                "word": raw_word.strip(),
+                "pos": pos,
+                "zh": zh or "—",
+                "collocation": collocation,
+            }
+    return vocab
+
+
+@st.cache_data(show_spinner=False)
+def _cached_ielts_vocab() -> dict[str, dict]:
+    return _load_ielts_vocab()
+
+
+def _simple_lemma(token: str) -> str:
+    w = token.lower()
+    if len(w) > 5 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if len(w) > 4 and w.endswith("ing"):
+        return w[:-3]
+    if len(w) > 3 and w.endswith("ed"):
+        return w[:-2]
+    if len(w) > 3 and w.endswith("es"):
+        return w[:-2]
+    if len(w) > 2 and w.endswith("s"):
+        return w[:-1]
+    return w
+
+
+def _paper_vocab_cards(paper_text: str, top_n: int = WAITING_VOCAB_TOPN) -> list[dict]:
+    vocab = _cached_ielts_vocab()
+    if not vocab:
+        return []
+    words = re.findall(r"[A-Za-z][A-Za-z' -]{0,40}", paper_text or "")
+    counts: dict[str, int] = {}
+    examples: dict[str, str] = {}
+    sentences = re.split(r"(?<=[.!?])\s+", str(paper_text or ""))
+
+    for token in words:
+        base = _simple_lemma(_normalize_word(token))
+        if not base:
+            continue
+        if base in vocab:
+            counts[base] = counts.get(base, 0) + 1
+
+    for sentence in sentences:
+        s = sentence.strip()
+        if len(s) < 20:
+            continue
+        norm = _normalize_word(s)
+        for w in counts:
+            if w in examples:
+                continue
+            if re.search(rf"\b{re.escape(w)}\b", norm):
+                examples[w] = s[:180]
+
+    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:top_n]
+    cards: list[dict] = []
+    for w, freq in ranked:
+        meta = vocab[w]
+        cards.append(
+            {
+                "word": meta.get("word", w),
+                "freq": int(freq),
+                "pos": meta.get("pos", "—"),
+                "zh": meta.get("zh", "—"),
+                "collocation": meta.get("collocation", "—"),
+                "example": examples.get(w, "暂无论文例句"),
+            }
+        )
+    return cards
 
 
 def _fmt_recommendation(data: dict) -> str:
@@ -772,6 +928,8 @@ if st.button("抽取正文", key="btn_extract"):
                     paper["reader_page_text_cache"] = {}
                     paper["reader_translation_cache"] = {}
                     paper["reader_page_image_cache"] = {}
+                    paper["waiting_vocab_cards"] = []
+                    paper["waiting_vocab_offset"] = 0
 
                     st.success(f"[{uploaded.name}] 抽取完成：共 {len(text)} 字")
 
@@ -803,6 +961,50 @@ if st.session_state.papers:
 if st.session_state.paper_text:
     st.caption(f"当前会话已缓存论文文本：**{len(st.session_state.paper_text)}** 字符。")
     st.text_area("正文预览", value=st.session_state.paper_text[:PREVIEW_CHARS], height=420)
+
+st.subheader("等待时背单词")
+st.caption("在翻译/分析/精读任务等待期间，按当前论文自动匹配雅思词汇。")
+if not st.session_state.paper_text.strip():
+    st.info("请先抽取正文，随后可在此学习论文命中的词汇。")
+else:
+    col_refresh, col_next, col_size = st.columns([1, 1, 1])
+    with col_refresh:
+        refresh_vocab = st.button("刷新词单", key="btn_waiting_vocab_refresh")
+    with col_next:
+        next_group = st.button("下一组", key="btn_waiting_vocab_next")
+    with col_size:
+        show_count = st.slider(
+            "每组词卡数",
+            min_value=3,
+            max_value=10,
+            value=int(st.session_state.get("waiting_vocab_show_count", WAITING_VOCAB_DEFAULT_COUNT)),
+            step=1,
+            key="waiting_vocab_show_count",
+        )
+
+    if refresh_vocab or not st.session_state.waiting_vocab_cards:
+        st.session_state.waiting_vocab_cards = _paper_vocab_cards(st.session_state.paper_text)
+        st.session_state.waiting_vocab_offset = 0
+        _persist_current_paper_from_session_state()
+
+    cards = list(st.session_state.waiting_vocab_cards)
+    if not cards:
+        st.warning("词表已加载，但当前论文未匹配到可学习词。可尝试切换论文或点击“刷新词单”。")
+    else:
+        if next_group:
+            st.session_state.waiting_vocab_offset = (
+                int(st.session_state.waiting_vocab_offset) + int(show_count)
+            ) % len(cards)
+            _persist_current_paper_from_session_state()
+        start = int(st.session_state.waiting_vocab_offset)
+        st.caption(f"已匹配词汇：**{len(cards)}** 个（按论文词频排序）")
+        for i in range(int(show_count)):
+            card = cards[(start + i) % len(cards)]
+            st.markdown(f"**{card['word']}** · {card['pos']} · 论文出现约 {card['freq']} 次")
+            st.markdown(f"- 中文：{card['zh']}")
+            st.markdown(f"- 固定搭配：{card['collocation']}")
+            st.markdown(f"- 论文例句：{card['example']}")
+            st.divider()
 
 st.divider()
 _jobs_open = bool(
