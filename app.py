@@ -1053,9 +1053,12 @@ def _tab_analyze_panel_impl():
                                         st.error(f"[全文分析流式] {event.get('detail', '未知错误')}")
                                         break
                 if isinstance(final_data, dict):
-                    st.session_state.analyze_table_markdown = str(
-                        final_data.get("table_markdown", "")
-                    )
+                    table_md = str(final_data.get("table_markdown", ""))
+                    st.session_state.analyze_table_markdown = table_md
+                    pid = st.session_state.get("current_paper_id")
+                    if pid and pid in st.session_state.papers:
+                        st.session_state.papers[pid]["analyze_table_markdown"] = table_md
+                    _persist_current_paper_from_session_state()
                     st.success("填表结果完成。")
             except httpx.RequestError as e:
                 st.error(f"[全文分析] 无法连接后端。详情：{e}")
@@ -1104,9 +1107,13 @@ def _tab_analyze_panel_impl():
                                         st.error(f"[PaperNote 流式] {event.get('detail', '未知错误')}")
                                         break
                 if isinstance(final_data, dict):
-                    st.session_state.papernote_markdown = str(
-                        final_data.get("papernote_markdown", "")
-                    )
+                    note_md = str(final_data.get("papernote_markdown", ""))
+                    st.session_state.papernote_markdown = note_md
+                    # Write-through to per-paper store immediately so “综合综述” can see it without switching.
+                    pid = st.session_state.get("current_paper_id")
+                    if pid and pid in st.session_state.papers:
+                        st.session_state.papers[pid]["papernote_markdown"] = note_md
+                    _persist_current_paper_from_session_state()
                     st.success("PaperNote 笔记完成。")
             except httpx.RequestError as e:
                 st.error(f"[PaperNote] 无法连接后端。详情：{e}")
