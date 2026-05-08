@@ -781,6 +781,10 @@ if st.session_state.papers:
         format_func=lambda pid: st.session_state.papers[pid]["pdf_name"],
         key="current_paper_picker",
     )
+    # Persist active paper first, then switch binding to avoid losing unsynced outputs.
+    previous_id = st.session_state.current_paper_id
+    if previous_id and selected_id != previous_id:
+        _persist_current_paper_from_session_state()
     st.session_state.current_paper_id = selected_id
     _bind_current_paper_to_session_state()
 
@@ -1133,12 +1137,27 @@ def _tab_review_panel_impl():
         " 请先为至少两篇论文生成 PaperNote，再执行综合综述。"
     )
     rendered_review_stream_this_run = False
+    # Ensure currently opened paper's latest in-memory note is included in aggregation.
+    _persist_current_paper_from_session_state()
 
     available_notes: list[str] = []
+    ready_names: list[str] = []
+    missing_names: list[str] = []
     for pid in st.session_state.papers.keys():
+        name = st.session_state.papers[pid].get("pdf_name", pid)
         note_md = st.session_state.papers[pid].get("papernote_markdown", "")
         if note_md and str(note_md).strip():
             available_notes.append(str(note_md))
+            ready_names.append(str(name))
+        else:
+            missing_names.append(str(name))
+
+    if ready_names:
+        st.caption("已具备 PaperNote 的论文：")
+        st.write("、".join(ready_names))
+    if missing_names:
+        st.caption("尚未生成 PaperNote 的论文：")
+        st.write("、".join(missing_names))
 
     if len(available_notes) < 2:
         st.info("当前可用于综述的 PaperNote 少于 2 篇。请先切换论文并生成 PaperNote 笔记。")
