@@ -236,6 +236,21 @@ def _persist_current_paper_from_session_state() -> None:
     paper["reading_last_recommendation"] = st.session_state.reading_last_recommendation
 
 
+def _current_paper_filename_prefix() -> str:
+    name = str(st.session_state.get("pdf_name", "") or "").strip()
+    if not name:
+        return "paper"
+    stem = os.path.splitext(name)[0].strip()
+    stem = stem.replace(" ", "_")
+    return stem or "paper"
+
+
+def _safe_name_stem(name: str) -> str:
+    stem = os.path.splitext(str(name).strip())[0]
+    stem = stem.replace(" ", "_")
+    return stem or "paper"
+
+
 def _render_analysis_result(data: dict) -> None:
     if data.get("truncation_note"):
         st.info(data["truncation_note"])
@@ -1081,16 +1096,17 @@ def _tab_analyze_panel_impl():
             except httpx.RequestError as e:
                 st.error(f"[全文分析] 无法连接后端。详情：{e}")
 
-    if st.session_state.analyze_table_markdown and not rendered_table_stream_this_run:
-        with st.expander("填表结果（Markdown 表格）", expanded=True):
-            st.markdown(st.session_state.analyze_table_markdown)
-            st.download_button(
-                label="下载填表 Markdown",
-                data=str(st.session_state.analyze_table_markdown).encode("utf-8"),
-                file_name="paperpilot_table.md",
-                mime="text/markdown",
-                key="download_table_md",
-            )
+    if st.session_state.analyze_table_markdown:
+        if not rendered_table_stream_this_run:
+            with st.expander("填表结果（Markdown 表格）", expanded=True):
+                st.markdown(st.session_state.analyze_table_markdown)
+        st.download_button(
+            label="下载填表 Markdown",
+            data=str(st.session_state.analyze_table_markdown).encode("utf-8"),
+            file_name=f"{_current_paper_filename_prefix()}_table.md",
+            mime="text/markdown",
+            key="download_table_md",
+        )
 
     if st.button("生成 PaperNote 笔记", key="btn_papernote"):
         if not st.session_state.paper_text.strip():
@@ -1153,7 +1169,7 @@ def _tab_analyze_panel_impl():
             st.download_button(
                 label="下载 PaperNote Markdown",
                 data=str(st.session_state.papernote_markdown).encode("utf-8"),
-                file_name="paperpilot_papernote.md",
+                file_name=f"{_current_paper_filename_prefix()}_papernote.md",
                 mime="text/markdown",
                 key="download_papernote_md",
             )
@@ -1283,13 +1299,21 @@ def _tab_review_panel_impl():
                 st.error(f"[综合综述] 无法连接后端。详情：{e}")
 
     if st.session_state.review_markdown and not rendered_review_stream_this_run:
+        selected_for_name = st.session_state.get("review_selected_papers", [])
+        selected_stems: list[str] = []
+        for pid in selected_for_name:
+            if pid in st.session_state.papers:
+                selected_stems.append(
+                    _safe_name_stem(st.session_state.papers[pid].get("pdf_name", pid))
+                )
+        review_prefix = "_".join(selected_stems) if selected_stems else "review"
         with st.expander("综合文献综述（Markdown）", expanded=True):
             with st.container(border=True):
                 st.markdown(st.session_state.review_markdown)
             st.download_button(
                 label="下载综述 Markdown",
                 data=str(st.session_state.review_markdown).encode("utf-8"),
-                file_name="paperpilot_review.md",
+                file_name=f"{review_prefix}_review.md",
                 mime="text/markdown",
                 key="download_review_md",
             )
