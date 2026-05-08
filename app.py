@@ -10,7 +10,6 @@ import httpx
 import streamlit as st
 from dotenv import load_dotenv
 
-from services.markdown_export import analysis_to_markdown
 from services.analyze_pipeline import PAPERNOTE_TEMPLATE, TABLE_TEMPLATE
 
 load_dotenv()
@@ -251,39 +250,6 @@ def _safe_name_stem(name: str) -> str:
     return stem or "paper"
 
 
-def _render_analysis_result(data: dict) -> None:
-    if data.get("truncation_note"):
-        st.info(data["truncation_note"])
-    st.markdown(f"### 一句话\n{data.get('one_liner_zh', '')}")
-    st.markdown(
-        f"**类型**：{data.get('paper_type_guess', '')}  "
-        f"**元信息**：{data.get('metadata_summary', '')}"
-    )
-    st.markdown("### 方法要点")
-    st.markdown(data.get("method_summary") or "—")
-    st.markdown("### 局限")
-    st.markdown(data.get("limitations") or "—")
-    st.markdown("### 关键句")
-    for i, row in enumerate(data.get("key_sentences") or [], start=1):
-        if not isinstance(row, dict):
-            continue
-        with st.expander(f"关键句 {i}"):
-            st.markdown(f"> {row.get('en', '')}")
-            st.markdown(f"**注释**：{row.get('zh_note', '')}")
-            st.markdown(f"**重要性**：{row.get('why_important', '')}")
-    st.caption(f"已生成段落对照：**{len(data.get('paragraph_pairs') or [])}** 对。")
-    md_bytes = analysis_to_markdown(data).encode("utf-8")
-    st.download_button(
-        label="下载 Markdown",
-        data=md_bytes,
-        file_name="paperpilot_analysis.md",
-        mime="text/markdown",
-        key="download_analysis_md",
-    )
-    with st.expander("原始 JSON（分析结果）"):
-        st.json(data)
-
-
 def _fmt_recommendation(data: dict) -> str:
     rec = data.get("recommendation", data)
     lines = [
@@ -300,6 +266,20 @@ def _fmt_recommendation(data: dict) -> str:
     lines.extend(["", "**下一步**"])
     for x in rec.get("next_steps") or []:
         lines.append(f"- {x}")
+    return "\n".join(lines)
+
+
+def _recommendation_to_markdown(data: dict) -> str:
+    rec = data.get("recommendation", data)
+    used = int(data.get("paper_chars_used", 0) or 0)
+    lines = [
+        "# 精读建议",
+        "",
+        f"- 论文摘录使用字符数：{used}",
+        "",
+        _fmt_recommendation({"recommendation": rec}),
+        "",
+    ]
     return "\n".join(lines)
 
 
@@ -807,7 +787,7 @@ if st.session_state.papers:
         default_index = paper_ids.index(st.session_state.current_paper_id)
     st.caption(f"已加载论文：{len(paper_ids)} 篇")
     selected_id = st.radio(
-        "切换当前论文（用于阅读器/翻译/填表/精读）",
+        "切换当前论文",
         options=paper_ids,
         index=default_index,
         format_func=lambda pid: st.session_state.papers[pid]["pdf_name"],
@@ -848,9 +828,9 @@ with st.expander("后台任务状态（全局，页末统一轮询）", expanded
         st.caption("当前无进行中的后台任务。")
 
 def _tab_reader_panel_impl():
-    st.subheader("双栏阅读器（纯 Python：左图右译）")
+    st.subheader("双栏阅读器")
     st.caption(
-        "左侧按页渲染 PDF 图片，右侧显示整页中文翻译（页面阅读样式）。"
+        "左侧按页渲染 PDF 图片，右侧显示整页中文翻译。"
         " 「翻译本页」为**流式输出**；亦可使用下方全局后台任务轮询查看旧式异步翻译。"
         " 若为扫描版 PDF，整页文本抽取可能较弱。"
     )
@@ -1166,13 +1146,13 @@ def _tab_analyze_panel_impl():
         with st.expander("PaperNote 笔记（Markdown）", expanded=expand_note):
             with st.container(border=True):
                 st.markdown(st.session_state.papernote_markdown)
-            st.download_button(
-                label="下载 PaperNote Markdown",
-                data=str(st.session_state.papernote_markdown).encode("utf-8"),
-                file_name=f"{_current_paper_filename_prefix()}_papernote.md",
-                mime="text/markdown",
-                key="download_papernote_md",
-            )
+        st.download_button(
+            label="下载 PaperNote Markdown",
+            data=str(st.session_state.papernote_markdown).encode("utf-8"),
+            file_name=f"{_current_paper_filename_prefix()}_papernote.md",
+            mime="text/markdown",
+            key="download_papernote_md",
+        )
         if expand_note:
             st.session_state.papernote_just_generated = False
 
@@ -1244,7 +1224,6 @@ def _tab_review_panel_impl():
         selected_ids = st.multiselect(
             "勾选要参与综合综述的论文",
             options=ready_ids,
-            default=st.session_state.review_selected_papers,
             format_func=lambda pid: st.session_state.papers[pid].get("pdf_name", pid),
             key="review_selected_papers",
         )
@@ -1299,6 +1278,11 @@ def _tab_review_panel_impl():
                 st.error(f"[综合综述] 无法连接后端。详情：{e}")
 
     if st.session_state.review_markdown and not rendered_review_stream_this_run:
+        with st.expander("综合文献综述（Markdown）", expanded=True):
+            with st.container(border=True):
+                st.markdown(st.session_state.review_markdown)
+
+    if st.session_state.review_markdown:
         selected_for_name = st.session_state.get("review_selected_papers", [])
         selected_stems: list[str] = []
         for pid in selected_for_name:
@@ -1307,16 +1291,13 @@ def _tab_review_panel_impl():
                     _safe_name_stem(st.session_state.papers[pid].get("pdf_name", pid))
                 )
         review_prefix = "_".join(selected_stems) if selected_stems else "review"
-        with st.expander("综合文献综述（Markdown）", expanded=True):
-            with st.container(border=True):
-                st.markdown(st.session_state.review_markdown)
-            st.download_button(
-                label="下载综述 Markdown",
-                data=str(st.session_state.review_markdown).encode("utf-8"),
-                file_name=f"{review_prefix}_review.md",
-                mime="text/markdown",
-                key="download_review_md",
-            )
+        st.download_button(
+            label="下载综述 Markdown",
+            data=str(st.session_state.review_markdown).encode("utf-8"),
+            file_name=f"{review_prefix}_review.md",
+            mime="text/markdown",
+            key="download_review_md",
+        )
 
 
 def _tab_reading_panel_impl():
@@ -1382,8 +1363,6 @@ def _tab_reading_panel_impl():
                     "paper_text": st.session_state.paper_text,
                     "max_paper_chars": int(max_chars),
                 }
-                stream_slot = st.empty()
-                stream_text: list[str] = []
                 final_data = None
                 stream_timeout = httpx.Timeout(connect=10.0, read=240.0, write=60.0, pool=10.0)
                 with st.spinner("正在流式生成精读建议…"):
@@ -1399,10 +1378,7 @@ def _tab_reading_panel_impl():
                                 for event in _iter_ndjson_events(r):
                                     et = event.get("type")
                                     if et == "delta":
-                                        piece = str(event.get("text", ""))
-                                        if piece:
-                                            stream_text.append(piece)
-                                            stream_slot.code("".join(stream_text), language="json")
+                                        continue
                                     elif et == "final":
                                         final_data = event.get("data")
                                         break
@@ -1420,8 +1396,6 @@ def _tab_reading_panel_impl():
             st.warning("请先填写阅读动机/需求。")
         else:
             try:
-                stream_slot = st.empty()
-                stream_text: list[str] = []
                 final_data = None
                 stream_timeout = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
                 with st.spinner("正在流式执行一键精读…"):
@@ -1445,10 +1419,7 @@ def _tab_reading_panel_impl():
                                         if isinstance(data, dict):
                                             st.session_state.reading_structured_intent = data
                                     elif et == "delta":
-                                        piece = str(event.get("text", ""))
-                                        if piece:
-                                            stream_text.append(piece)
-                                            stream_slot.code("".join(stream_text), language="json")
+                                        continue
                                     elif et == "final":
                                         final_data = event.get("data")
                                         break
@@ -1471,12 +1442,13 @@ def _tab_reading_panel_impl():
         st.caption(f"论文摘录使用：**{used}** 字符。")
         with st.expander("精读建议正文", expanded=True):
             st.markdown(_fmt_recommendation(body))
-        with st.expander("原始 JSON（recommendation）", expanded=False):
-            st.json(body.get("recommendation", body))
-
-    if st.session_state.reading_structured_intent and not (do_structure or do_pipeline):
-        with st.expander("当前会话中的结构化需求", expanded=False):
-            st.json(st.session_state.reading_structured_intent)
+        st.download_button(
+            label="下载精读建议 Markdown",
+            data=_recommendation_to_markdown(body).encode("utf-8"),
+            file_name=f"{_current_paper_filename_prefix()}_reading.md",
+            mime="text/markdown",
+            key="download_reading_md",
+        )
 
     _persist_current_paper_from_session_state()
 
