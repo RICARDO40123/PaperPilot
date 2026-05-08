@@ -11,6 +11,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from services.markdown_export import analysis_to_markdown
+from services.analyze_pipeline import PAPERNOTE_TEMPLATE, TABLE_TEMPLATE
 
 load_dotenv()
 
@@ -717,10 +718,7 @@ else:
 
 st.divider()
 st.subheader("抽取 PDF 正文（不经大模型）")
-st.caption(
-    "使用后端 **pypdf** 抽字；抽取结果会写入会话，供「全文分析」「精读建议」作为论文上下文。"
-    " **URL / arXiv** 可后续再加。"
-)
+
 
 uploaded_files = st.file_uploader(
     "选择 PDF 文件（可多选）", type=["pdf"], accept_multiple_files=True, key="pdf_uploader"
@@ -1008,12 +1006,15 @@ def _tab_reader_panel_impl():
 
 
 def _tab_analyze_panel_impl():
-    st.subheader("逐篇填表（8维度 Markdown 表格，流式生成）")
+    st.subheader("全文分析")
     st.caption(
-        "基于会话中的 **论文正文** 调用千问，按模板逐维度填写并只输出 Markdown 表格。"
+        "基于会话中的 **论文正文** 调用大模型，按模板逐维度填写并只输出 Markdown 表格。"
         " 默认 **流式生成**；若输出失败会提示回退或报错。"
-        " 需 **OPENAI_API_KEY**。超长正文仅截取前 N 字（见下方）。"
     )
+    with st.expander("预览：填表输出模板", expanded=False):
+        st.markdown(TABLE_TEMPLATE)
+    with st.expander("预览：PaperNote 输出模板", expanded=False):
+        st.markdown(PAPERNOTE_TEMPLATE)
 
     analyze_mode = st.radio(
         "分析深度",
@@ -1154,7 +1155,6 @@ def _tab_analyze_panel_impl():
         if expand_note:
             st.session_state.papernote_just_generated = False
 
-    st.caption("综合文献综述已拆分到独立模块「综合综述」，并且只基于 PaperNote 笔记生成。")
 
 
 
@@ -1293,14 +1293,13 @@ def _tab_review_panel_impl():
 def _tab_reading_panel_impl():
     st.subheader("精读建议（千问 · 结构化需求）")
     st.caption(
-        "流程：**自然语言 → 结构化 JSON（唯一意图依据）→ 结合论文摘录给出是否精读**。"
+        "流程：**自然语言 → 结构化 JSON→ 结合论文摘录给出是否精读**。"
         " 后续推理**不直接使用**你的原始句子，只使用结构化结果。"
         " 「生成精读建议 / 一键」为 **流式输出**；「结构化需求」仍可走异步任务 + 上方轮询。"
-        " 需在 `.env` 配置 **OPENAI_API_KEY**（可配合 DashScope 兼容模式），并 `pip install openai`。"
     )
 
     user_prompt = st.text_area(
-        "你为什么读这篇论文？想得到什么启发或内容？（可写得模糊，先做结构化）",
+        "想从这篇论文得到什么启发或内容？",
         height=120,
         key="user_reading_prompt",
     )
@@ -1471,7 +1470,6 @@ if segmented is not None:
         "模块导航",
         options=tab_options,
         selection_mode="single",
-        default=st.session_state.active_module,
         key="active_module",
     )
 else:
