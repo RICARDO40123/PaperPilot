@@ -5,6 +5,7 @@ import time
 import json
 import uuid
 import re
+import random
 from html import escape
 
 import httpx
@@ -29,6 +30,7 @@ MAX_READING_JOB_WAIT_SEC = 600.0
 PREVIEW_CHARS = 8000
 WAITING_VOCAB_DEFAULT_COUNT = 6
 WAITING_VOCAB_TOPN = 120
+WAITING_VOCAB_MIN_COUNT = 40
 IELTS_WORD_XLS_PATH = os.path.join("IELTSword", "ielts", "ielts.xls")
 
 st.set_page_config(page_title="PaperPilot", layout="wide")
@@ -403,6 +405,27 @@ def _paper_vocab_cards(paper_text: str, top_n: int = WAITING_VOCAB_TOPN) -> list
                 "example": examples.get(w, "暂无论文例句"),
             }
         )
+
+    # If matched words are fewer than target, randomly sample from IELTS vocab
+    # to make the waiting-learning pool more stable.
+    if len(cards) < WAITING_VOCAB_MIN_COUNT:
+        existed = {str(c.get("word", "")).strip().lower() for c in cards}
+        pool = [k for k, v in vocab.items() if str(v.get("word", k)).strip().lower() not in existed]
+        need = WAITING_VOCAB_MIN_COUNT - len(cards)
+        if pool and need > 0:
+            sampled = random.sample(pool, k=min(need, len(pool)))
+            for w in sampled:
+                meta = vocab[w]
+                cards.append(
+                    {
+                        "word": meta.get("word", w),
+                        "freq": 0,
+                        "pos": meta.get("pos", "—"),
+                        "zh": meta.get("zh", "—"),
+                        "collocation": meta.get("collocation", "—"),
+                        "example": "暂无论文例句",
+                    }
+                )
     return cards
 
 
@@ -962,8 +985,7 @@ if st.session_state.paper_text:
     st.caption(f"当前会话已缓存论文文本：**{len(st.session_state.paper_text)}** 字符。")
     st.text_area("正文预览", value=st.session_state.paper_text[:PREVIEW_CHARS], height=420)
 
-st.subheader("等待时背单词")
-st.caption("在翻译/分析/精读任务等待期间，按当前论文自动匹配雅思词汇。")
+st.subheader("等待时背单词区")
 if not st.session_state.paper_text.strip():
     st.info("请先抽取正文，随后可在此学习论文命中的词汇。")
 else:
@@ -1002,7 +1024,6 @@ else:
             card = cards[(start + i) % len(cards)]
             st.markdown(f"**{card['word']}** · {card['pos']} · 论文出现约 {card['freq']} 次")
             st.markdown(f"- 中文：{card['zh']}")
-            st.markdown(f"- 固定搭配：{card['collocation']}")
             st.markdown(f"- 论文例句：{card['example']}")
             st.divider()
 
