@@ -1115,6 +1115,8 @@ def _tab_analyze_panel_impl():
                         st.session_state.papers[pid]["papernote_markdown"] = note_md
                     _persist_current_paper_from_session_state()
                     st.success("PaperNote 笔记完成。")
+                    # st.tabs 切换不会触发 rerun；这里主动 rerun 让“综合综述”列表立即刷新。
+                    st.rerun()
             except httpx.RequestError as e:
                 st.error(f"[PaperNote] 无法连接后端。详情：{e}")
 
@@ -1147,12 +1149,23 @@ def _tab_review_panel_impl():
     # Ensure currently opened paper's latest in-memory note is included in aggregation.
     _persist_current_paper_from_session_state()
 
+    # Extra write-through: in fragment-rerun situations, the global note may update
+    # but per-paper cache might not yet. Ensure we count the current paper correctly.
+    active_pid = st.session_state.get("current_paper_id")
+    active_note = st.session_state.get("papernote_markdown", "")
+    if active_pid and active_pid in st.session_state.papers:
+        if active_note and not str(st.session_state.papers[active_pid].get("papernote_markdown", "")):
+            st.session_state.papers[active_pid]["papernote_markdown"] = active_note
+            _persist_current_paper_from_session_state()
+
     available_notes: list[str] = []
     ready_names: list[str] = []
     missing_names: list[str] = []
     for pid in st.session_state.papers.keys():
         name = st.session_state.papers[pid].get("pdf_name", pid)
         note_md = st.session_state.papers[pid].get("papernote_markdown", "")
+        if pid == active_pid and active_note and not str(note_md).strip():
+            note_md = active_note
         if note_md and str(note_md).strip():
             available_notes.append(str(note_md))
             ready_names.append(str(name))
@@ -1388,7 +1401,9 @@ def _tab_reading_panel_impl():
 
 _tab_reader_panel = _maybe_fragment(_tab_reader_panel_impl)
 _tab_analyze_panel = _maybe_fragment(_tab_analyze_panel_impl)
-_tab_review_panel = _maybe_fragment(_tab_review_panel_impl)
+# 综合综述需要在切 Tab 时立即读取最新 per-paper 状态；
+# st.fragment 可能导致缓存不刷新，因此这里不做 fragment 隔离。
+_tab_review_panel = _tab_review_panel_impl
 _tab_reading_panel = _maybe_fragment(_tab_reading_panel_impl)
 
 tab_reader, tab_analyze, tab_review, tab_reading = st.tabs(
