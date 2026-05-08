@@ -92,6 +92,8 @@ if "analyze_table_markdown" not in st.session_state:
     st.session_state.analyze_table_markdown = ""
 if "review_markdown" not in st.session_state:
     st.session_state.review_markdown = ""
+if "papernote_markdown" not in st.session_state:
+    st.session_state.papernote_markdown = ""
 
 
 def _new_paper_entry(
@@ -119,6 +121,7 @@ def _new_paper_entry(
         "reader_page_image_cache": {},
         # analyze/recommend results
         "analyze_table_markdown": "",
+        "papernote_markdown": "",
         "reading_structured_intent": None,
         "reading_last_recommendation": None,
         "analyze_max_chars": analyze_default,
@@ -159,6 +162,7 @@ def _bind_current_paper_to_session_state() -> None:
     st.session_state.reader_page_image_cache = paper["reader_page_image_cache"]
 
     st.session_state.analyze_table_markdown = paper.get("analyze_table_markdown", "")
+    st.session_state.papernote_markdown = paper.get("papernote_markdown", "")
     st.session_state.analyze_max_chars = int(
         paper.get("analyze_max_chars", st.session_state.get("analyze_max_chars", 14000))
     )
@@ -197,6 +201,7 @@ def _persist_current_paper_from_session_state() -> None:
     paper["reader_page_image_cache"] = st.session_state.reader_page_image_cache
 
     paper["analyze_table_markdown"] = st.session_state.analyze_table_markdown
+    paper["papernote_markdown"] = st.session_state.papernote_markdown
     paper["analyze_max_chars"] = int(
         st.session_state.get("analyze_max_chars", paper.get("analyze_max_chars", 14000))
     )
@@ -980,7 +985,7 @@ def _tab_reader_panel_impl():
 
 
 def _tab_analyze_panel_impl():
-    st.subheader("逐篇填表（9维度 Markdown 表格，流式生成）")
+    st.subheader("逐篇填表（8维度 Markdown 表格，流式生成）")
     st.caption(
         "基于会话中的 **论文正文** 调用千问，按模板逐维度填写并只输出 Markdown 表格。"
         " 默认 **流式生成**；若输出失败会提示回退或报错。"
@@ -1003,7 +1008,7 @@ def _tab_analyze_panel_impl():
         key="analyze_max_chars",
     )
     rendered_table_stream_this_run = False
-    rendered_review_stream_this_run = False
+    rendered_note_stream_this_run = False
 
     if st.button("生成填表结果", key="btn_analyze"):
         if not st.session_state.paper_text.strip():
@@ -1055,14 +1060,90 @@ def _tab_analyze_panel_impl():
         with st.expander("填表结果（Markdown 表格）", expanded=True):
             st.markdown(st.session_state.analyze_table_markdown)
 
-    # 综合综述：基于所有已填表论文
-    available_tables: list[str] = []
-    for pid in st.session_state.papers.keys():
-        table_md = st.session_state.papers[pid].get("analyze_table_markdown", "")
-        if table_md and str(table_md).strip():
-            available_tables.append(str(table_md))
+    if st.button("生成 PaperNote 笔记", key="btn_papernote"):
+        if not st.session_state.paper_text.strip():
+            st.warning("请先在上方抽取 PDF 正文，或自行粘贴到会话（当前为空）。")
+        else:
+            try:
+                payload = {
+                    "paper_text": st.session_state.paper_text,
+                    "mode": analyze_mode,
+                    "max_input_chars": int(analyze_cap),
+                }
+                stream_slot = st.empty()
+                stream_text: list[str] = []
+                final_data: dict | None = None
+                note_timeout = httpx.Timeout(connect=10.0, read=240.0, write=60.0, pool=10.0)
+                with st.spinner("正在流式生成 PaperNote 笔记…"):
+                    with httpx.Client(timeout=note_timeout, trust_env=False) as client:
+                        with client.stream(
+                            "POST",
+                            f"{backend_url}/analyze/papernote/stream",
+                            json=payload,
+                        ) as r:
+                            if r.status_code != 200:
+                                _api_err("PaperNote", r.status_code, _http_detail(r))
+                            else:
+                                for event in _iter_ndjson_events(r):
+                                    et = event.get("type")
+                                    if et == "delta":
+                                        piece = str(event.get("text", ""))
+                                        if piece:
+                                            stream_text.append(piece)
+                                            with stream_slot.container(border=True):
+                                                st.markdown("".join(stream_text))
+                                            rendered_note_stream_this_run = True
+                                    elif et == "final":
+                                        final_data = event.get("data")
+                                        break
+                                    elif et == "error":
+                                        st.error(f"[PaperNote 流式] {event.get('detail', '未知错误')}")
+                                        break
+                if isinstance(final_data, dict):
+                    st.session_state.papernote_markdown = str(
+                        final_data.get("papernote_markdown", "")
+                    )
+                    st.success("PaperNote 笔记完成。")
+            except httpx.RequestError as e:
+                st.error(f"[PaperNote] 无法连接后端。详情：{e}")
 
-    if len(available_tables) >= 2:
+    if st.session_state.papernote_markdown and not rendered_note_stream_this_run:
+        with st.expander("PaperNote 笔记（Markdown）", expanded=False):
+            with st.container(border=True):
+                st.markdown(st.session_state.papernote_markdown)
+            st.download_button(
+                label="下载 PaperNote Markdown",
+                data=str(st.session_state.papernote_markdown).encode("utf-8"),
+                file_name="paperpilot_papernote.md",
+                mime="text/markdown",
+                key="download_papernote_md",
+            )
+
+    st.caption("综合文献综述已拆分到独立模块「综合综述」，并且只基于 PaperNote 笔记生成。")
+
+
+
+    _persist_current_paper_from_session_state()
+
+
+def _tab_review_panel_impl():
+    st.subheader("综合文献综述（基于 PaperNote）")
+    st.caption(
+        "该模块仅汇总各论文的 PaperNote 笔记。"
+        " 请先为至少两篇论文生成 PaperNote，再执行综合综述。"
+    )
+    rendered_review_stream_this_run = False
+
+    available_notes: list[str] = []
+    for pid in st.session_state.papers.keys():
+        note_md = st.session_state.papers[pid].get("papernote_markdown", "")
+        if note_md and str(note_md).strip():
+            available_notes.append(str(note_md))
+
+    if len(available_notes) < 2:
+        st.info("当前可用于综述的 PaperNote 少于 2 篇。请先切换论文并生成 PaperNote 笔记。")
+    else:
+        st.caption(f"当前可用于综述的 PaperNote：{len(available_notes)} 篇")
         if st.button("生成综合文献综述", key="btn_review"):
             try:
                 stream_slot = st.empty()
@@ -1074,7 +1155,7 @@ def _tab_analyze_panel_impl():
                         with client.stream(
                             "POST",
                             f"{backend_url}/review/stream",
-                            json={"tables": available_tables},
+                            json={"papernotes": available_notes},
                         ) as r:
                             if r.status_code != 200:
                                 _api_err("综合综述", r.status_code, _http_detail(r))
@@ -1103,7 +1184,7 @@ def _tab_analyze_panel_impl():
                 st.error(f"[综合综述] 无法连接后端。详情：{e}")
 
     if st.session_state.review_markdown and not rendered_review_stream_this_run:
-        with st.expander("综合文献综述（Markdown）", expanded=False):
+        with st.expander("综合文献综述（Markdown）", expanded=True):
             with st.container(border=True):
                 st.markdown(st.session_state.review_markdown)
             st.download_button(
@@ -1114,9 +1195,6 @@ def _tab_analyze_panel_impl():
                 key="download_review_md",
             )
 
-
-
-    _persist_current_paper_from_session_state()
 
 def _tab_reading_panel_impl():
     st.subheader("精读建议（千问 · 结构化需求）")
@@ -1284,15 +1362,21 @@ def _tab_reading_panel_impl():
 
 _tab_reader_panel = _maybe_fragment(_tab_reader_panel_impl)
 _tab_analyze_panel = _maybe_fragment(_tab_analyze_panel_impl)
+_tab_review_panel = _maybe_fragment(_tab_review_panel_impl)
 _tab_reading_panel = _maybe_fragment(_tab_reading_panel_impl)
 
-tab_reader, tab_analyze, tab_reading = st.tabs(["双栏阅读器", "全文分析", "精读建议"])
+tab_reader, tab_analyze, tab_review, tab_reading = st.tabs(
+    ["双栏阅读器", "全文分析", "综合综述", "精读建议"]
+)
 
 with tab_reader:
     _tab_reader_panel()
 
 with tab_analyze:
     _tab_analyze_panel()
+
+with tab_review:
+    _tab_review_panel()
 
 with tab_reading:
     _tab_reading_panel()

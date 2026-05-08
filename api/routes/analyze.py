@@ -18,6 +18,9 @@ from services.analyze_pipeline import (
     extract_markdown_table,
     REVIEW_SYSTEM,
     build_review_user_message,
+    PAPERNOTE_SYSTEM,
+    build_papernote_user_message,
+    extract_papernote_markdown,
 )
 from services.llm import LLMConfigError
 from services.task_store import analyze_job_store, start_analyze_job
@@ -84,7 +87,10 @@ def post_analyze_table_stream(body: AnalyzeRequest) -> StreamingResponse:
 def post_review_stream(body: ReviewRequest) -> StreamingResponse:
     def _gen() -> Iterator[bytes]:
         try:
-            user_msg = build_review_user_message(body.tables)
+            sources = body.sources()
+            if len(sources) < 2:
+                raise ValueError("至少需要 2 篇 PaperNote 笔记才能生成综合文献综述。")
+            user_msg = build_review_user_message(sources)
             pieces: list[str] = []
             for chunk in llm.chat_text_stream(REVIEW_SYSTEM, user_msg):
                 if not chunk:
@@ -93,6 +99,25 @@ def post_review_stream(body: ReviewRequest) -> StreamingResponse:
                 yield _stream_event({"type": "delta", "text": chunk})
             review_md = "".join(pieces).strip()
             yield _stream_event({"type": "final", "data": {"review_markdown": review_md}})
+        except Exception as e:  # noqa: BLE001
+            yield _stream_event({"type": "error", "detail": str(e)})
+
+    return StreamingResponse(_gen(), media_type="application/x-ndjson; charset=utf-8")
+
+
+@router.post("/analyze/papernote/stream")
+def post_analyze_papernote_stream(body: AnalyzeRequest) -> StreamingResponse:
+    def _gen() -> Iterator[bytes]:
+        try:
+            user_msg, _excerpt = build_papernote_user_message(body)
+            pieces: list[str] = []
+            for chunk in llm.chat_text_stream(PAPERNOTE_SYSTEM, user_msg):
+                if not chunk:
+                    continue
+                pieces.append(chunk)
+                yield _stream_event({"type": "delta", "text": chunk})
+            note_md = extract_papernote_markdown("".join(pieces))
+            yield _stream_event({"type": "final", "data": {"papernote_markdown": note_md}})
         except Exception as e:  # noqa: BLE001
             yield _stream_event({"type": "error", "detail": str(e)})
 
