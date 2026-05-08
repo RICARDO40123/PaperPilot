@@ -328,17 +328,11 @@ def _load_ielts_vocab() -> dict[str, dict]:
             if not word:
                 continue
             meaning = str(sh.cell_value(r, m_col)).strip()
-            # If no meaning cell exists, still keep the word.
-            pos_matches = re.findall(r"\b(?:n|v|vt|vi|adj|adv|prep|conj|pron|aux|num|art|int)\.", meaning)
-            pos = " / ".join(sorted(set(pos_matches))) if pos_matches else "—"
-            zh = re.sub(r"\b(?:n|v|vt|vi|adj|adv|prep|conj|pron|aux|num|art|int)\.", "", meaning).strip(" ;,，；")
-            if not zh:
-                zh = meaning if meaning else "—"
+            meaning_text = meaning if meaning else "—"
             collocation = raw_word.strip() if " " in raw_word.strip() else "—"
             vocab[word] = {
                 "word": raw_word.strip(),
-                "pos": pos,
-                "zh": zh or "—",
+                "meaning": meaning_text,
                 "collocation": collocation,
             }
     return vocab
@@ -399,8 +393,7 @@ def _paper_vocab_cards(paper_text: str, top_n: int = WAITING_VOCAB_TOPN) -> list
             {
                 "word": meta.get("word", w),
                 "freq": int(freq),
-                "pos": meta.get("pos", "—"),
-                "zh": meta.get("zh", "—"),
+                "meaning": meta.get("meaning", "—"),
                 "collocation": meta.get("collocation", "—"),
                 "example": examples.get(w, "暂无论文例句"),
             }
@@ -420,8 +413,7 @@ def _paper_vocab_cards(paper_text: str, top_n: int = WAITING_VOCAB_TOPN) -> list
                     {
                         "word": meta.get("word", w),
                         "freq": 0,
-                        "pos": meta.get("pos", "—"),
-                        "zh": meta.get("zh", "—"),
+                        "meaning": meta.get("meaning", "—"),
                         "collocation": meta.get("collocation", "—"),
                         "example": "暂无论文例句",
                     }
@@ -1019,11 +1011,11 @@ else:
             ) % len(cards)
             _persist_current_paper_from_session_state()
         start = int(st.session_state.waiting_vocab_offset)
-        st.caption(f"已匹配词汇：**{len(cards)}** 个（按论文词频排序）")
+        st.caption(f"已匹配词汇：**{len(cards)}** 个")
         for i in range(int(show_count)):
             card = cards[(start + i) % len(cards)]
-            st.markdown(f"**{card['word']}** · {card['pos']} · 论文出现约 {card['freq']} 次")
-            st.markdown(f"- 中文：{card['zh']}")
+            st.markdown(f"**{card['word']}** · 论文出现约 {card['freq']} 次")
+            st.markdown(f"- 词性/中文：{card['meaning']}")
             st.markdown(f"- 论文例句：{card['example']}")
             st.divider()
 
