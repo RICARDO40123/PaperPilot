@@ -94,6 +94,8 @@ if "review_markdown" not in st.session_state:
     st.session_state.review_markdown = ""
 if "papernote_markdown" not in st.session_state:
     st.session_state.papernote_markdown = ""
+if "papernote_just_generated" not in st.session_state:
+    st.session_state.papernote_just_generated = False
 
 
 def _new_paper_entry(
@@ -200,8 +202,25 @@ def _persist_current_paper_from_session_state() -> None:
     paper["reader_translation_cache"] = st.session_state.reader_translation_cache
     paper["reader_page_image_cache"] = st.session_state.reader_page_image_cache
 
-    paper["analyze_table_markdown"] = st.session_state.analyze_table_markdown
-    paper["papernote_markdown"] = st.session_state.papernote_markdown
+    current_table_md = str(st.session_state.get("analyze_table_markdown", "") or "")
+    cached_table_md = str(paper.get("analyze_table_markdown", "") or "")
+    if current_table_md.strip():
+        paper["analyze_table_markdown"] = current_table_md
+    elif cached_table_md:
+        # Prevent blank overwrite when switching modules/reruns.
+        st.session_state.analyze_table_markdown = cached_table_md
+    else:
+        paper["analyze_table_markdown"] = ""
+
+    current_note_md = str(st.session_state.get("papernote_markdown", "") or "")
+    cached_note_md = str(paper.get("papernote_markdown", "") or "")
+    if current_note_md.strip():
+        paper["papernote_markdown"] = current_note_md
+    elif cached_note_md:
+        # Prevent blank overwrite when switching modules/reruns.
+        st.session_state.papernote_markdown = cached_note_md
+    else:
+        paper["papernote_markdown"] = ""
     paper["analyze_max_chars"] = int(
         st.session_state.get("analyze_max_chars", paper.get("analyze_max_chars", 14000))
     )
@@ -1114,14 +1133,15 @@ def _tab_analyze_panel_impl():
                     if pid and pid in st.session_state.papers:
                         st.session_state.papers[pid]["papernote_markdown"] = note_md
                     _persist_current_paper_from_session_state()
+                    st.session_state.papernote_just_generated = True
                     st.success("PaperNote 笔记完成。")
-                    # st.tabs 切换不会触发 rerun；这里主动 rerun 让“综合综述”列表立即刷新。
                     st.rerun()
             except httpx.RequestError as e:
                 st.error(f"[PaperNote] 无法连接后端。详情：{e}")
 
     if st.session_state.papernote_markdown and not rendered_note_stream_this_run:
-        with st.expander("PaperNote 笔记（Markdown）", expanded=False):
+        expand_note = bool(st.session_state.get("papernote_just_generated", False))
+        with st.expander("PaperNote 笔记（Markdown）", expanded=expand_note):
             with st.container(border=True):
                 st.markdown(st.session_state.papernote_markdown)
             st.download_button(
@@ -1131,6 +1151,8 @@ def _tab_analyze_panel_impl():
                 mime="text/markdown",
                 key="download_papernote_md",
             )
+        if expand_note:
+            st.session_state.papernote_just_generated = False
 
     st.caption("综合文献综述已拆分到独立模块「综合综述」，并且只基于 PaperNote 笔记生成。")
 
@@ -1159,6 +1181,7 @@ def _tab_review_panel_impl():
             _persist_current_paper_from_session_state()
 
     available_notes: list[str] = []
+    ready_ids: list[str] = []
     ready_names: list[str] = []
     missing_names: list[str] = []
     for pid in st.session_state.papers.keys():
@@ -1168,6 +1191,7 @@ def _tab_review_panel_impl():
             note_md = active_note
         if note_md and str(note_md).strip():
             available_notes.append(str(note_md))
+            ready_ids.append(str(pid))
             ready_names.append(str(name))
         else:
             missing_names.append(str(name))
@@ -1179,10 +1203,41 @@ def _tab_review_panel_impl():
         st.caption("尚未生成 PaperNote 的论文：")
         st.write("、".join(missing_names))
 
-    if len(available_notes) < 2:
+    selected_ids: list[str] = []
+    if ready_ids:
+        prev_ready_ids = set(st.session_state.get("review_selectable_papers", []))
+        curr_ready_ids = set(ready_ids)
+        current_selected = [
+            pid
+            for pid in st.session_state.get("review_selected_papers", [])
+            if pid in curr_ready_ids
+        ]
+        # Auto-include newly available papers so users don't get stuck at <2 after fresh analyses.
+        newly_available = [pid for pid in ready_ids if pid in (curr_ready_ids - prev_ready_ids)]
+        merged_selected = current_selected + [pid for pid in newly_available if pid not in current_selected]
+        if not merged_selected:
+            merged_selected = list(ready_ids)
+        st.session_state.review_selected_papers = merged_selected
+        st.session_state.review_selectable_papers = list(ready_ids)
+
+        selected_ids = st.multiselect(
+            "勾选要参与综合综述的论文",
+            options=ready_ids,
+            default=st.session_state.review_selected_papers,
+            format_func=lambda pid: st.session_state.papers[pid].get("pdf_name", pid),
+            key="review_selected_papers",
+        )
+
+    selected_notes: list[str] = []
+    for pid in selected_ids:
+        note_md = st.session_state.papers.get(pid, {}).get("papernote_markdown", "")
+        if note_md and str(note_md).strip():
+            selected_notes.append(str(note_md))
+
+    if len(selected_notes) < 2:
         st.info("当前可用于综述的 PaperNote 少于 2 篇。请先切换论文并生成 PaperNote 笔记。")
     else:
-        st.caption(f"当前可用于综述的 PaperNote：{len(available_notes)} 篇")
+        st.caption(f"当前已勾选用于综述的 PaperNote：{len(selected_notes)} 篇")
         if st.button("生成综合文献综述", key="btn_review"):
             try:
                 stream_slot = st.empty()
@@ -1194,7 +1249,7 @@ def _tab_review_panel_impl():
                         with client.stream(
                             "POST",
                             f"{backend_url}/review/stream",
-                            json={"papernotes": available_notes},
+                            json={"papernotes": selected_notes},
                         ) as r:
                             if r.status_code != 200:
                                 _api_err("综合综述", r.status_code, _http_detail(r))
@@ -1406,20 +1461,34 @@ _tab_analyze_panel = _maybe_fragment(_tab_analyze_panel_impl)
 _tab_review_panel = _tab_review_panel_impl
 _tab_reading_panel = _maybe_fragment(_tab_reading_panel_impl)
 
-tab_reader, tab_analyze, tab_review, tab_reading = st.tabs(
-    ["双栏阅读器", "全文分析", "综合综述", "精读建议"]
-)
+tab_options = ["双栏阅读器", "全文分析", "综合综述", "精读建议"]
+if "active_module" not in st.session_state:
+    st.session_state.active_module = "双栏阅读器"
 
-with tab_reader:
+segmented = getattr(st, "segmented_control", None)
+if segmented is not None:
+    active_module = segmented(
+        "模块导航",
+        options=tab_options,
+        selection_mode="single",
+        default=st.session_state.active_module,
+        key="active_module",
+    )
+else:
+    active_module = st.radio(
+        "模块导航",
+        options=tab_options,
+        horizontal=True,
+        key="active_module",
+    )
+
+if active_module == "双栏阅读器":
     _tab_reader_panel()
-
-with tab_analyze:
+elif active_module == "全文分析":
     _tab_analyze_panel()
-
-with tab_review:
+elif active_module == "综合综述":
     _tab_review_panel()
-
-with tab_reading:
+else:
     _tab_reading_panel()
 
 _persist_current_paper_from_session_state()
