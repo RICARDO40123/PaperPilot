@@ -855,7 +855,6 @@ def _tab_reader_panel_impl():
             st.number_input(
                 "当前页码",
                 min_value=1,
-                value=max(1, int(st.session_state.reader_page_input)),
                 step=1,
                 key="reader_page_input",
             )
@@ -1008,7 +1007,7 @@ def _tab_reader_panel_impl():
 def _tab_analyze_panel_impl():
     st.subheader("全文分析")
     st.caption(
-        "基于会话中的 **论文正文** 调用大模型，按模板逐维度填写并只输出 Markdown 表格。"
+        "基于会话中的 **论文正文** 调用大模型进行分析。"
         " 默认 **流式生成**；若输出失败会提示回退或报错。"
     )
     with st.expander("预览：填表输出模板", expanded=False):
@@ -1027,7 +1026,6 @@ def _tab_analyze_panel_impl():
         "喂给模型的最大字符数（从正文开头截断）",
         min_value=2000,
         max_value=100000,
-        value=14000,
         step=1000,
         key="analyze_max_chars",
     )
@@ -1086,6 +1084,13 @@ def _tab_analyze_panel_impl():
     if st.session_state.analyze_table_markdown and not rendered_table_stream_this_run:
         with st.expander("填表结果（Markdown 表格）", expanded=True):
             st.markdown(st.session_state.analyze_table_markdown)
+            st.download_button(
+                label="下载填表 Markdown",
+                data=str(st.session_state.analyze_table_markdown).encode("utf-8"),
+                file_name="paperpilot_table.md",
+                mime="text/markdown",
+                key="download_table_md",
+            )
 
     if st.button("生成 PaperNote 笔记", key="btn_papernote"):
         if not st.session_state.paper_text.strip():
@@ -1291,11 +1296,10 @@ def _tab_review_panel_impl():
 
 
 def _tab_reading_panel_impl():
-    st.subheader("精读建议（千问 · 结构化需求）")
+    st.subheader("精读建议")
     st.caption(
         "流程：**自然语言 → 结构化 JSON→ 结合论文摘录给出是否精读**。"
         " 后续推理**不直接使用**你的原始句子，只使用结构化结果。"
-        " 「生成精读建议 / 一键」为 **流式输出**；「结构化需求」仍可走异步任务 + 上方轮询。"
     )
 
     user_prompt = st.text_area(
