@@ -28,7 +28,7 @@
 - 安装依赖：`pip install -r requirements.txt`
 - 复制配置：`copy .env.example .env`。
   - **PDF 抽取 / 按页渲染 / 等待时背单词**：只需 `BACKEND_URL`；按页图片依赖 **`pymupdf`**，词表读取依赖 **`xlrd`**（见 `requirements.txt`）。
-  - **整页翻译 / 精读 / 结构化需求 / 全文分析**：均需 **`OPENAI_API_KEY`** + `openai`。可选 **`OPENAI_BASE_URL`**（默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`）与 **`OPENAI_MODEL`**（默认 `qwen-turbo`）。
+  - **整页翻译 / 精读 / 结构化需求 / 全文分析**：均需 **`OPENAI_API_KEY`** + `openai`。可选 **`OPENAI_BASE_URL`**（默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`）与 **`OPENAI_MODEL`**（默认 `qwen3.6-plus`）。
 
 ## 启动（需两个终端，项目根目录）
 
