@@ -1,6 +1,6 @@
 # PaperPilot
 
-论文阅读辅助：Streamlit 前端 + FastAPI 后端（Python 课设）。需求与路线见 [final-plan.md](final-plan.md)、总需求见 [plan.md](plan.md)。
+论文阅读辅助：Streamlit 前端 + FastAPI 后端。
 
 ## 功能概览（与当前 UI 对齐）
 
