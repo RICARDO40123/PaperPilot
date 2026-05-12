@@ -29,6 +29,20 @@
 - 复制配置：`copy .env.example .env`。
   - **PDF 抽取 / 按页渲染 / 等待时背单词**：只需 `BACKEND_URL`；按页图片依赖 **`pymupdf`**，词表读取依赖 **`xlrd`**（见 `requirements.txt`）。
   - **整页翻译 / 精读 / 结构化需求 / 全文分析**：均需 **`OPENAI_API_KEY`** + `openai`。可选 **`OPENAI_BASE_URL`**（默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`）与 **`OPENAI_MODEL`**（默认 `qwen3.6-plus`）。
+  - **应用日志**：可选 **`LOG_LEVEL`**、**`PAPERPILOT_LOG_DIR`**、**`LOG_TO_CONSOLE`**（详见 `.env.example`）。
+
+## 日志
+
+应用层日志（logger 名 `paperpilot.*`）由 [`services/log_config.py`](services/log_config.py) 配置，**默认写入项目下 `logs/` 目录**，不在前后端终端刷屏：
+
+| 文件 | 说明 |
+| --- | --- |
+| `logs/backend.log` | FastAPI（`uvicorn`）进程 |
+| `logs/streamlit.log` | Streamlit 进程 |
+
+单文件约 5MB 自动滚动、保留若干备份。需在项目根目录启动进程，或设置 **`PAPERPILOT_LOG_DIR`** 为绝对路径，以免工作目录变化导致日志写到别处。
+
+**说明**：`uvicorn` 自带的 **HTTP access**（每条请求一行）仍默认出现在启动后端的终端里，与上述 `paperpilot` 文件日志是两套；若也要收进文件，需在启动命令里单独配置 uvicorn 的 log 设置。
 
 ## 启动（需两个终端，项目根目录）
 
