@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from collections.abc import Iterator
@@ -12,6 +13,8 @@ try:
     from openai import OpenAI
 except ImportError:
     OpenAI = None
+
+_log = logging.getLogger("paperpilot.llm")
 
 
 class LLMConfigError(RuntimeError):
@@ -60,6 +63,7 @@ def chat_text(system: str, user: str) -> str:
         ],
         )
     except Exception as e:  # noqa: BLE001
+        _log.warning("chat.completions 非流式调用失败: %s", e)
         raise RuntimeError(f"OpenAI 兼容接口调用失败：{e}") from e
     return _message_content(resp)
 
@@ -100,6 +104,7 @@ def chat_text_stream(system: str, user: str) -> Iterator[str]:
                         if maybe:
                             yield str(maybe)
     except Exception as e:  # noqa: BLE001
+        _log.warning("chat.completions 流式调用失败: %s", e)
         raise RuntimeError(f"OpenAI 兼容流式接口调用失败：{e}") from e
 
 

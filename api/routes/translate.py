@@ -1,5 +1,6 @@
 """Lightweight translation routes."""
 
+import logging
 from collections.abc import Iterator
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -12,13 +13,18 @@ from services import llm
 from services.task_store import start_translate_job, translate_job_store
 
 router = APIRouter(tags=["translate"])
+_log = logging.getLogger("paperpilot.routes.translate")
 
 
 def _translate_stream(req: TranslateRequest) -> Iterator[bytes]:
-    user_msg = f"mode={req.mode}\n\n原文：\n{req.text}"
-    for piece in llm.chat_text_stream(TRANSLATE_SYSTEM, user_msg):
-        if piece:
-            yield piece.encode("utf-8")
+    try:
+        user_msg = f"mode={req.mode}\n\n原文：\n{req.text}"
+        for piece in llm.chat_text_stream(TRANSLATE_SYSTEM, user_msg):
+            if piece:
+                yield piece.encode("utf-8")
+    except Exception as e:  # noqa: BLE001
+        _log.warning("/translate/stream generator error: %s", e)
+        raise
 
 
 @router.post("/translate", response_model=TranslateResponse)

@@ -1,6 +1,7 @@
 """Structured intent + deep-read recommendation (Qwen via DashScope)."""
 
 import json
+import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -28,6 +29,7 @@ from services import llm
 from services.task_store import reading_job_store, start_reading_job
 
 router = APIRouter(prefix="/reading", tags=["reading"])
+_log = logging.getLogger("paperpilot.routes.reading")
 
 
 def _stream_event(payload: dict) -> bytes:
@@ -82,6 +84,7 @@ def post_recommend_stream(body: RecommendReadingRequest) -> StreamingResponse:
             resp = RecommendReadingResponse(recommendation=rec, paper_chars_used=used)
             yield _stream_event({"type": "final", "data": resp.model_dump()})
         except Exception as e:  # noqa: BLE001
+            _log.warning("/reading/recommend/stream error: %s", e)
             yield _stream_event({"type": "error", "detail": str(e)})
 
     return StreamingResponse(_gen(), media_type="application/x-ndjson; charset=utf-8")
@@ -134,6 +137,7 @@ def post_advise_stream(body: ReadingAdviseRequest) -> StreamingResponse:
             )
             yield _stream_event({"type": "final", "data": resp.model_dump()})
         except Exception as e:  # noqa: BLE001
+            _log.warning("/reading/advise/stream error: %s", e)
             yield _stream_event({"type": "error", "detail": str(e)})
 
     return StreamingResponse(_gen(), media_type="application/x-ndjson; charset=utf-8")

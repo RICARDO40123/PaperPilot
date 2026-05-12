@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -18,6 +19,8 @@ JOB_TTL_SECONDS = 30 * 60
 MAX_CONCURRENT_ANALYZE = 2
 MAX_CONCURRENT_TRANSLATE = 2
 MAX_CONCURRENT_READING = 2
+
+_log = logging.getLogger("paperpilot.task_store")
 
 
 def _utc_now() -> datetime:
@@ -74,6 +77,7 @@ class AnalyzeJobStore:
         rec = AnalyzeJobRecord(job_id=job_id, request=req, status="queued", progress=0)
         with self._lock:
             self._jobs[job_id] = rec
+        _log.info("analyze job submitted job_id=%s", job_id)
         return job_id
 
     def get(self, job_id: str) -> AnalyzeJobRecord | None:
@@ -111,17 +115,22 @@ def _run_analyze_job(job_id: str) -> None:
     store = analyze_job_store
     rec = store.get(job_id)
     if not rec:
+        _log.warning("analyze job missing record job_id=%s", job_id)
         return
 
     store.update_status(job_id, "queued", progress=0)
     if not store.acquire_concurrency_slot(blocking=True):
+        _log.warning("analyze job no concurrency slot job_id=%s", job_id)
         store.update_status(job_id, "failed", error="无法获取分析并发槽位")
         return
     try:
+        _log.info("analyze job running job_id=%s", job_id)
         store.update_status(job_id, "running", progress=10)
         resp = run_analyze(rec.request)
         store.update_status(job_id, "done", progress=100, result=resp)
+        _log.info("analyze job done job_id=%s", job_id)
     except Exception as e:  # noqa: BLE001
+        _log.warning("analyze job failed job_id=%s: %s", job_id, e)
         store.update_status(job_id, "failed", progress=0, error=str(e))
     finally:
         store.release_concurrency_slot()
@@ -179,6 +188,7 @@ class TranslateJobStore:
         rec = TranslateJobRecord(job_id=job_id, request=req, status="queued", progress=0)
         with self._lock:
             self._jobs[job_id] = rec
+        _log.info("translate job submitted job_id=%s", job_id)
         return job_id
 
     def get(self, job_id: str) -> TranslateJobRecord | None:
@@ -216,17 +226,22 @@ def _run_translate_job(job_id: str) -> None:
     store = translate_job_store
     rec = store.get(job_id)
     if not rec:
+        _log.warning("translate job missing record job_id=%s", job_id)
         return
 
     store.update_status(job_id, "queued", progress=0)
     if not store.acquire_concurrency_slot(blocking=True):
+        _log.warning("translate job no concurrency slot job_id=%s", job_id)
         store.update_status(job_id, "failed", error="无法获取翻译并发槽位")
         return
     try:
+        _log.info("translate job running job_id=%s", job_id)
         store.update_status(job_id, "running", progress=10)
         zh = translate_to_zh(rec.request)
         store.update_status(job_id, "done", progress=100, result=TranslateResponse(zh=zh))
+        _log.info("translate job done job_id=%s", job_id)
     except Exception as e:  # noqa: BLE001
+        _log.warning("translate job failed job_id=%s: %s", job_id, e)
         store.update_status(job_id, "failed", progress=0, error=str(e))
     finally:
         store.release_concurrency_slot()
@@ -292,6 +307,7 @@ class ReadingJobStore:
         )
         with self._lock:
             self._jobs[job_id] = rec
+        _log.info("reading job submitted kind=structure job_id=%s", job_id)
         return job_id
 
     def submit_recommend(self, body: RecommendReadingRequest) -> str:
@@ -305,6 +321,7 @@ class ReadingJobStore:
         )
         with self._lock:
             self._jobs[job_id] = rec
+        _log.info("reading job submitted kind=recommend job_id=%s", job_id)
         return job_id
 
     def submit_advise(self, body: ReadingAdviseRequest) -> str:
@@ -318,6 +335,7 @@ class ReadingJobStore:
         )
         with self._lock:
             self._jobs[job_id] = rec
+        _log.info("reading job submitted kind=advise job_id=%s", job_id)
         return job_id
 
     def get(self, job_id: str) -> ReadingJobRecord | None:
@@ -355,17 +373,21 @@ def _run_reading_job(job_id: str) -> None:
     store = reading_job_store
     rec = store.get(job_id)
     if not rec:
+        _log.warning("reading job missing record job_id=%s", job_id)
         return
 
     store.update_status(job_id, "queued", progress=0)
     if not store.acquire_concurrency_slot(blocking=True):
+        _log.warning("reading job no concurrency slot job_id=%s kind=%s", job_id, rec.kind)
         store.update_status(job_id, "failed", error="无法获取精读任务并发槽位")
         return
     try:
+        _log.info("reading job running job_id=%s kind=%s", job_id, rec.kind)
         store.update_status(job_id, "running", progress=10)
         if rec.kind == "structure" and rec.structure_body:
             out = structure_user_intent(rec.structure_body.user_prompt)
             store.update_status(job_id, "done", progress=100, result=out.model_dump())
+            _log.info("reading job done job_id=%s kind=%s", job_id, rec.kind)
         elif rec.kind == "recommend" and rec.recommend_body:
             b = rec.recommend_body
             rec_obj, used = recommend_deep_read(
@@ -382,6 +404,7 @@ def _run_reading_job(job_id: str) -> None:
                     "paper_chars_used": used,
                 },
             )
+            _log.info("reading job done job_id=%s kind=%s", job_id, rec.kind)
         elif rec.kind == "advise" and rec.advise_body:
             b = rec.advise_body
             pipe = run_pipeline(
@@ -395,9 +418,12 @@ def _run_reading_job(job_id: str) -> None:
                 progress=100,
                 result=pipe.model_dump(),
             )
+            _log.info("reading job done job_id=%s kind=%s", job_id, rec.kind)
         else:
+            _log.warning("reading job invalid payload job_id=%s kind=%s", job_id, rec.kind)
             store.update_status(job_id, "failed", error="任务载荷无效")
     except Exception as e:  # noqa: BLE001
+        _log.warning("reading job failed job_id=%s kind=%s: %s", job_id, rec.kind, e)
         store.update_status(job_id, "failed", progress=0, error=str(e))
     finally:
         store.release_concurrency_slot()

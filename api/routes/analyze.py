@@ -1,6 +1,7 @@
 """Full-paper analysis (Qwen JSON) — sync, stream and async job API."""
 
 import json
+import logging
 from collections.abc import Iterator
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -27,6 +28,7 @@ from services.task_store import analyze_job_store, start_analyze_job
 from models.review_api import ReviewRequest
 
 router = APIRouter(tags=["analyze"])
+_log = logging.getLogger("paperpilot.routes.analyze")
 
 
 def _stream_event(payload: dict) -> bytes:
@@ -59,6 +61,7 @@ def post_analyze_stream(body: AnalyzeRequest) -> StreamingResponse:
             parsed = parse_analyze_raw("".join(pieces), body, excerpt_len, truncated)
             yield _stream_event({"type": "final", "data": parsed.model_dump()})
         except Exception as e:  # noqa: BLE001
+            _log.warning("/analyze/stream error: %s", e)
             yield _stream_event({"type": "error", "detail": str(e)})
 
     return StreamingResponse(_gen(), media_type="application/x-ndjson; charset=utf-8")
@@ -78,6 +81,7 @@ def post_analyze_table_stream(body: AnalyzeRequest) -> StreamingResponse:
             table_md = extract_markdown_table("".join(pieces))
             yield _stream_event({"type": "final", "data": {"table_markdown": table_md}})
         except Exception as e:  # noqa: BLE001
+            _log.warning("/analyze/table/stream error: %s", e)
             yield _stream_event({"type": "error", "detail": str(e)})
 
     return StreamingResponse(_gen(), media_type="application/x-ndjson; charset=utf-8")
@@ -100,6 +104,7 @@ def post_review_stream(body: ReviewRequest) -> StreamingResponse:
             review_md = "".join(pieces).strip()
             yield _stream_event({"type": "final", "data": {"review_markdown": review_md}})
         except Exception as e:  # noqa: BLE001
+            _log.warning("/review/stream error: %s", e)
             yield _stream_event({"type": "error", "detail": str(e)})
 
     return StreamingResponse(_gen(), media_type="application/x-ndjson; charset=utf-8")
@@ -119,6 +124,7 @@ def post_analyze_papernote_stream(body: AnalyzeRequest) -> StreamingResponse:
             note_md = extract_papernote_markdown("".join(pieces))
             yield _stream_event({"type": "final", "data": {"papernote_markdown": note_md}})
         except Exception as e:  # noqa: BLE001
+            _log.warning("/analyze/papernote/stream error: %s", e)
             yield _stream_event({"type": "error", "detail": str(e)})
 
     return StreamingResponse(_gen(), media_type="application/x-ndjson; charset=utf-8")

@@ -1,11 +1,14 @@
 """PDF extract routes."""
 
+import logging
+
 from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile
 
 from models.extract import ExtractResponse, PageTextResponse
 from services.parser import extract_pdf_bytes, extract_pdf_page_text, render_pdf_page_image
 
 router = APIRouter(tags=["extract"])
+_log = logging.getLogger("paperpilot.routes.extract")
 
 
 @router.post("/extract/file", response_model=ExtractResponse)
@@ -18,6 +21,7 @@ async def extract_file(file: UploadFile = File(...)) -> ExtractResponse:
     try:
         text, pdf_quality, warning = extract_pdf_bytes(data)
     except ValueError as e:
+        _log.warning("extract/file failed: %s", e)
         raise HTTPException(status_code=400, detail=str(e)) from e
     return ExtractResponse(
         text=text,
@@ -40,6 +44,7 @@ async def extract_page_text(
     try:
         text, page_count = extract_pdf_page_text(data, page_index=page - 1)
     except ValueError as e:
+        _log.warning("extract/page-text failed page=%s: %s", page, e)
         raise HTTPException(status_code=400, detail=str(e)) from e
     return PageTextResponse(page=page, page_count=page_count, text=text)
 
@@ -58,5 +63,6 @@ async def extract_page_image(
     try:
         image, _ = render_pdf_page_image(data, page_index=page - 1, dpi=dpi)
     except ValueError as e:
+        _log.warning("extract/page-image failed page=%s dpi=%s: %s", page, dpi, e)
         raise HTTPException(status_code=400, detail=str(e)) from e
     return Response(content=image, media_type="image/png")

@@ -3,6 +3,7 @@
 import os
 import time
 import json
+import logging
 import uuid
 import re
 import random
@@ -15,6 +16,11 @@ from dotenv import load_dotenv
 from services.analyze_pipeline import PAPERNOTE_TEMPLATE, TABLE_TEMPLATE
 
 load_dotenv()
+
+from services.log_config import ensure_paperpilot_logging
+
+ensure_paperpilot_logging(service="streamlit")
+_log_ui = logging.getLogger("paperpilot.streamlit")
 
 DEFAULT_BACKEND = "http://127.0.0.1:8000"
 TIMEOUT_HEALTH = 10.0
@@ -705,6 +711,7 @@ def poll_background_jobs() -> None:
                 st.session_state.reading_poll_ui = {}
                 st.warning(f"未知精读任务状态：{status}")
         except httpx.RequestError as e:
+            _log_ui.warning("精读轮询请求失败: %s", e)
             st.error(f"精读轮询失败：{e}")
 
     def _analyze() -> None:
@@ -771,6 +778,7 @@ def poll_background_jobs() -> None:
                 st.session_state.analyze_poll_ui = {}
                 st.warning(f"未知分析任务状态：{status}")
         except httpx.RequestError as e:
+            _log_ui.warning("分析任务轮询请求失败: %s", e)
             st.error(f"分析轮询失败：{e}")
 
     def _translate() -> None:
@@ -840,6 +848,7 @@ def poll_background_jobs() -> None:
                 st.session_state.reader_poll_translate_ui = {}
                 st.warning(f"未知翻译任务状态：{status}")
         except httpx.RequestError as e:
+            _log_ui.warning("翻译任务轮询请求失败: %s", e)
             st.error(f"翻译轮询失败：{e}")
 
     _reading()
@@ -863,6 +872,11 @@ if st.button("检查后端健康 (/health)"):
             st.success("后端响应正常")
             st.json(r.json())
     except httpx.HTTPStatusError as e:
+        _log_ui.warning(
+            "健康检查 HTTP 错误: %s %s",
+            e.response.status_code,
+            _http_detail(e.response)[:500],
+        )
         hint = ""
         if e.response.status_code in (502, 503, 504):
             hint = (
@@ -872,6 +886,7 @@ if st.button("检查后端健康 (/health)"):
             )
         _api_err("健康检查", e.response.status_code, _http_detail(e.response) + hint)
     except httpx.RequestError as e:
+        _log_ui.warning("健康检查无法连接 %s: %s", url, e)
         st.error(
             f"[健康检查] 无法连接 `{url}`。请先在该目录另开终端运行：\n\n"
             f"`uvicorn api.main:app --reload --port 8000`\n\n详情：{e}"
@@ -916,7 +931,12 @@ if st.button("抽取正文", key="btn_extract"):
                             "application/pdf",
                         )
                     }
-                    r = client.post(post_url, files=files)
+                    try:
+                        r = client.post(post_url, files=files)
+                    except httpx.RequestError as e:
+                        _log_ui.warning("抽取正文请求失败 %s: %s", uploaded.name, e)
+                        st.error(f"[抽取 PDF] {uploaded.name} 无法连接后端：{e}")
+                        continue
                     if r.status_code != 200:
                         try:
                             err = r.json()
@@ -1108,6 +1128,7 @@ def _tab_reader_panel_impl():
             except RuntimeError as e:
                 st.error(str(e))
             except httpx.RequestError as e:
+                _log_ui.warning("阅读器页图请求失败: %s", e)
                 st.error(f"[页图] 请求失败：{e}")
 
         with right:
@@ -1120,6 +1141,7 @@ def _tab_reader_panel_impl():
             except RuntimeError as e:
                 st.error(str(e))
             except httpx.RequestError as e:
+                _log_ui.warning("阅读器页文本请求失败: %s", e)
                 st.error(f"[页文] 请求失败：{e}")
 
             if not page_text.strip():
@@ -1190,16 +1212,19 @@ def _tab_reader_panel_impl():
                         else:
                             st.warning("流式翻译未返回内容。")
                     except httpx.RequestError as e:
+                        _log_ui.warning("翻译本页流式请求失败: %s", e)
                         st.warning(f"流式翻译不可用，回退一次性接口。详情：{e}")
                         try:
                             _fallback_once()
                         except httpx.RequestError as ee:
+                            _log_ui.warning("翻译本页回退请求失败: %s", ee)
                             st.error(f"[翻译本页（回退）] 无法连接后端。详情：{ee}")
                     except RuntimeError as e:
                         st.warning(f"{e}，回退一次性接口。")
                         try:
                             _fallback_once()
                         except httpx.RequestError as ee:
+                            _log_ui.warning("翻译本页回退请求失败: %s", ee)
                             st.error(f"[翻译本页（回退）] 无法连接后端。详情：{ee}")
 
                 cached_zh = st.session_state.reader_translation_cache.get(page_cache_key)
@@ -1289,6 +1314,7 @@ def _tab_analyze_panel_impl():
                     _persist_current_paper_from_session_state()
                     st.success("填表结果完成。")
             except httpx.RequestError as e:
+                _log_ui.warning("全文分析填表流式请求失败: %s", e)
                 st.error(f"[全文分析] 无法连接后端。详情：{e}")
 
     if st.session_state.analyze_table_markdown:
@@ -1354,6 +1380,7 @@ def _tab_analyze_panel_impl():
                     st.success("PaperNote 笔记完成。")
                     st.rerun()
             except httpx.RequestError as e:
+                _log_ui.warning("PaperNote 流式请求失败: %s", e)
                 st.error(f"[PaperNote] 无法连接后端。详情：{e}")
 
     if st.session_state.papernote_markdown and not rendered_note_stream_this_run:
@@ -1490,6 +1517,7 @@ def _tab_review_panel_impl():
                     )
                     st.success("综合文献综述完成。")
             except httpx.RequestError as e:
+                _log_ui.warning("综合综述流式请求失败: %s", e)
                 st.error(f"[综合综述] 无法连接后端。详情：{e}")
 
     if st.session_state.review_markdown and not rendered_review_stream_this_run:
@@ -1566,6 +1594,7 @@ def _tab_reading_panel_impl():
                 else:
                     _api_err("结构化需求", r.status_code, _http_detail(r))
             except httpx.RequestError as e:
+                _log_ui.warning("精读结构化任务提交失败: %s", e)
                 st.error(f"[结构化需求] 无法连接后端。详情：{e}")
 
     if do_recommend:
@@ -1604,6 +1633,7 @@ def _tab_reading_panel_impl():
                     st.session_state.reading_last_recommendation = final_data
                     st.success("精读建议完成。")
             except httpx.RequestError as e:
+                _log_ui.warning("精读建议流式请求失败: %s", e)
                 st.error(f"[精读建议] 无法连接后端。详情：{e}")
 
     if do_pipeline:
@@ -1649,6 +1679,7 @@ def _tab_reading_panel_impl():
                     }
                     st.success("一键精读完成。")
             except httpx.RequestError as e:
+                _log_ui.warning("一键精读流式请求失败: %s", e)
                 st.error(f"[一键精读] 无法连接后端。详情：{e}")
 
     if st.session_state.reading_last_recommendation:
